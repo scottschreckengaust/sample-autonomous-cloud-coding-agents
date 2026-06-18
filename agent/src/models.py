@@ -2,30 +2,20 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
-class TaskType(StrEnum):
-    """Supported task types."""
-
-    new_task = "new_task"
-    pr_iteration = "pr_iteration"
-    pr_review = "pr_review"
-
-    @property
-    def is_pr_task(self) -> bool:
-        return self in (TaskType.pr_iteration, TaskType.pr_review)
-
-    @property
-    def is_read_only(self) -> bool:
-        return self == TaskType.pr_review
+from sanitization import sanitize_external_content
 
 
 class IssueComment(BaseModel):
-    """Single GitHub issue comment — mirrors ``IssueComment`` in context-hydration.ts."""
+    """Single GitHub issue comment — mirrors ``IssueComment`` in context-hydration.ts.
+
+    ``author`` and ``body`` are sanitized by a field validator at construction,
+    so EVERY instance — whatever code path built it — is safe by the time it
+    exists. Consumers must not sanitize again.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -33,9 +23,26 @@ class IssueComment(BaseModel):
     author: str
     body: str
 
+    @field_validator("author", "body", mode="after")
+    @classmethod
+    def _sanitize(cls, v: str) -> str:
+        # Enforced here, not at the fetch site, so a future second fetcher
+        # (or deserialization from a cache) cannot construct an instance
+        # carrying raw attacker-controllable GitHub content. Idempotent:
+        # re-validating already-sanitized text is a no-op.
+        return sanitize_external_content(v)
+
 
 class GitHubIssue(BaseModel):
-    """GitHub issue slice — mirrors ``GitHubIssueContext`` in context-hydration.ts."""
+    """GitHub issue slice — mirrors ``GitHubIssueContext`` in context-hydration.ts.
+
+    Externally-sourced fields (``title``, ``body``, and each comment's
+    ``author``/``body`` via :class:`IssueComment`) are sanitized by field
+    validators at construction: every construction path — ``fetch_github_issue``,
+    tests, any future fetcher or cache load — yields a sanitized instance.
+    Consumers (e.g. ``assemble_prompt``) must not sanitize again and only
+    apply presentation (untrusted-content delimiters).
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -43,6 +50,12 @@ class GitHubIssue(BaseModel):
     body: str = ""
     number: int
     comments: list[IssueComment] = Field(default_factory=list)
+
+    @field_validator("title", "body", mode="after")
+    @classmethod
+    def _sanitize(cls, v: str) -> str:
+        # See IssueComment._sanitize — same structural-enforcement rationale.
+        return sanitize_external_content(v)
 
 
 class MemoryContext(BaseModel):
@@ -60,6 +73,42 @@ ContentTrustLevel = Literal["trusted", "untrusted-external", "memory"]
 # Bump when this agent supports a new orchestrator HydratedContext shape
 # (see cdk/src/handlers/shared/context-hydration.ts).
 SUPPORTED_HYDRATED_CONTEXT_VERSION = 1
+
+# Attachment types — mirrors AttachmentType in cdk/src/handlers/shared/types.ts.
+AttachmentType = Literal["image", "file", "url"]
+
+# A SHA-256 digest rendered as lowercase hex is always 64 characters.
+SHA256_HEX_LEN = 64
+
+
+class AttachmentConfig(BaseModel):
+    """Attachment descriptor from the orchestrator — mirrors AgentAttachmentPayload in types.ts."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    attachment_id: str
+    type: AttachmentType
+    content_type: str
+    filename: str
+    s3_uri: str
+    s3_version_id: str
+    size_bytes: int
+    source_url: str | None = None
+    token_estimate: int | None = None
+    checksum_sha256: str
+
+    @model_validator(mode="after")
+    def _validate_integrity_fields(self) -> Self:
+        if not self.s3_version_id:
+            raise ValueError("s3_version_id is required for integrity verification")
+        if not self.checksum_sha256:
+            raise ValueError("checksum_sha256 is required for integrity verification")
+        # checksum must be lowercase hex (SHA-256 = 64 hex chars)
+        if len(self.checksum_sha256) != SHA256_HEX_LEN or not all(
+            c in "0123456789abcdef" for c in self.checksum_sha256
+        ):
+            raise ValueError("checksum_sha256 must be a 64-character lowercase hex string")
+        return self
 
 
 class HydratedContext(BaseModel):
@@ -94,23 +143,61 @@ class HydratedContext(BaseModel):
 class TaskConfig(BaseModel):
     model_config = ConfigDict(validate_assignment=True)
 
-    repo_url: str
+    # repo_url / github_token default to "" so a repo-less TaskConfig (#248
+    # Phase 3) is constructible. The _validate_requires_repo_has_repo validator
+    # below enforces that a repo-BOUND config (requires_repo=True, the default)
+    # still carries a repo_url — so dropping the field-level requirement does not
+    # weaken the coding-path invariant.
+    repo_url: str = ""
     issue_number: str = ""
     task_description: str = ""
-    github_token: str
+    github_token: str = ""
     aws_region: str
     anthropic_model: str = "us.anthropic.claude-sonnet-4-6"
     dry_run: bool = False
     max_turns: int = 10
     max_budget_usd: float | None = None
     system_prompt_overrides: str = ""
-    task_type: str = "new_task"
+    # The pinned workflow this task runs ({"id", "version"}), resolved at the
+    # create-task boundary and threaded through the payload (#248). None on
+    # local/batch runs, where the pipeline defaults to coding/new-task-v1.
+    resolved_workflow: dict | None = None
+    # The Cedar principal identity derived from the resolved workflow
+    # (id→legacy map, else "new_task"). The Agent::TaskAgent::"<id>" principal
+    # scheme is unchanged; since #248 Phase 2a, read-only enforcement no longer
+    # keys off this principal — it keys off ``read_only`` below.
+    policy_principal: str = "new_task"
+    # Whether the resolved workflow is read-only (may not mutate the working
+    # tree). Threaded into the Cedar request ``context.read_only`` so the
+    # hard-deny Write/Edit rules fire for *any* read-only workflow (#248
+    # Phase 2a), and drives the runner's allowed_tools tightening.
+    read_only: bool = False
+    # The SDK tool surface for this task, from the resolved workflow's
+    # ``agent_config.allowed_tools`` (#248). This is the second enforcement layer
+    # the design promises alongside ``read_only``: ``run_agent`` passes it to
+    # ``ClaudeAgentOptions.allowed_tools`` verbatim, and drops ``Write``/``Edit``
+    # when ``read_only`` is true. Empty list means "fall back to the built-in
+    # full surface" so legacy/batch callers that never resolved a workflow keep
+    # working unchanged; a workflow that wants to restrict tools MUST declare a
+    # non-empty list (every shipped workflow does).
+    allowed_tools: list[str] = Field(default_factory=list)
+    # Whether the resolved workflow requires a repo. False for repo-less
+    # knowledge workflows (#248 Phase 3): the pipeline skips clone/build/PR and
+    # drives the agent + deliver_artifact steps through the workflow runner.
+    # Defaults True so coding tasks (and any caller that omits it) keep the
+    # repo-bound path.
+    requires_repo: bool = True
+    # True when the resolved workflow operates on an existing PR (pr_* coding
+    # workflows) — gates the "resume existing branch / resolve PR" behavior that
+    # the removed task_type used to signal.
+    is_pr_workflow: bool = False
     branch_name: str = ""
     pr_number: str = ""
     task_id: str = ""
     # Inbound channel the task was submitted from (mirrors ChannelSource in
-    # cdk/src/handlers/shared/types.ts). Gates channel-specific MCP wiring and
-    # prompt additions. Empty string means "no channel context" (legacy / local).
+    # cdk/src/handlers/shared/types.ts: api | webhook | slack | linear | jira).
+    # Gates channel-specific MCP wiring and prompt additions. Empty string means
+    # "no channel context" (legacy / local).
     channel_source: str = ""
     channel_metadata: dict[str, str] = Field(default_factory=dict)
     # Platform user_id (Cognito ``sub``) threaded from the orchestrator
@@ -129,8 +216,30 @@ class TaskConfig(BaseModel):
     trace: bool = False
     # Enriched mid-flight by pipeline.py:
     cedar_policies: list[str] = []
+    # Cedar HITL (§7.3, §10.2). Per-task approval defaults threaded
+    # from the orchestrator payload; consumed by PolicyEngine at
+    # construction so the engine seeds ApprovalAllowlist and adopts
+    # the per-task timeout default.
+    approval_timeout_s: int | None = None
+    initial_approvals: list[str] = []
+    # Chunk 7: TaskTable-persisted ``approval_gate_count`` seeded into
+    # the session counter so container restarts (§13.6) resume the
+    # cumulative gate budget without resetting to 0. Threaded from the
+    # orchestrator payload; zero default preserves legacy callers.
+    initial_approval_gate_count: int = 0
+    # Chunk 7b (§4 step 5, decision #13): per-task approval-gate cap
+    # resolved at task submit-time from ``Blueprint.security.approvalGateCap``
+    # (or the platform default of 50). Persisted on the TaskRecord so
+    # it survives container restarts and mid-task blueprint edits do
+    # not shift the cap beneath a running task. ``None`` when the
+    # orchestrator payload did not include the field (legacy tasks);
+    # PolicyEngine falls back to its own default of 50 in that case.
+    approval_gate_cap: int | None = None
     issue: GitHubIssue | None = None
     base_branch: str | None = None
+    # Attachments from the orchestrator payload (Phase 3). Validated as
+    # AttachmentConfig models. Empty list for tasks without attachments.
+    attachments: list[AttachmentConfig] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _validate_trace_requires_user_id(self) -> Self:
@@ -151,6 +260,27 @@ class TaskConfig(BaseModel):
                 "is uploaded to traces/<user_id>/<task_id>.jsonl.gz (design "
                 "§10.1), and the get-trace-url handler refuses keys outside "
                 "the caller's traces/<user_id>/ prefix."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_requires_repo_has_repo(self) -> Self:
+        """Fail at construction when a repo-bound config has no repo (#248 Phase 3).
+
+        ``requires_repo`` defaults True, so a config that requires a repo but
+        carries an empty ``repo_url`` is an illegal state the repo-bound pipeline
+        (clone/build/PR) cannot run. The create-task boundary and ``build_config``
+        already enforce this upstream; this validator makes the invariant
+        self-enforcing on the type so a directly-constructed ``TaskConfig`` (tests,
+        future call sites) cannot represent it silently. Mirrors
+        ``_validate_trace_requires_user_id`` above.
+        """
+        if self.requires_repo and not self.repo_url:
+            raise ValueError(
+                "requires_repo=True requires a non-empty repo_url. A repo-less "
+                "workflow must set requires_repo=False (resolved from the "
+                "workflow's requires_repo); a repo-bound workflow must supply "
+                "repo_url ('owner/repo')."
             )
         return self
 
@@ -185,6 +315,11 @@ class AgentResult(BaseModel):
     session_id: str = ""
     error: str | None = None
     usage: TokenUsage | None = None
+    # The agent's final result text (ResultMessage.result on success). For a
+    # repo-less knowledge task this IS the deliverable that deliver_artifact
+    # uploads/posts (#248 Phase 3). Empty for coding tasks (their product is the
+    # PR, not the text).
+    result_text: str = ""
 
 
 class TaskResult(BaseModel):
@@ -226,3 +361,7 @@ class TaskResult(BaseModel):
     # TaskRecord's ``trace_s3_uri`` field is set atomically with the
     # terminal-status transition (design §10.1).
     trace_s3_uri: str | None = None
+    # S3 URI of a repo-less workflow's delivered artifact (deliver_artifact, #248
+    # Phase 3), or ``None`` for coding tasks / when no artifact was delivered.
+    # Surfaced on TaskDetail so the user can retrieve the knowledge-task output.
+    artifact_uri: str | None = None

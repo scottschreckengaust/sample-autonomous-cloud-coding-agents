@@ -15,7 +15,11 @@ The Docker image is built for `linux/arm64` to match AgentCore Runtime requireme
 
 ### GitHub PAT — Minimal Permissions
 
-Create a **fine-grained PAT** at GitHub > Settings > Developer settings > Personal access tokens > Fine-grained tokens.
+Two token types work. Choose based on your access model:
+
+#### Fine-grained PAT (recommended for repos you own)
+
+Go to GitHub > **Settings** > **Developer settings** > **Fine-grained tokens**.
 
 **Repository access**: Select only the specific repo(s) the agent will work on.
 
@@ -26,7 +30,29 @@ Create a **fine-grained PAT** at GitHub > Settings > Developer settings > Person
 | **Issues** | Read | Fetch issue title, body, and comments for context |
 | **Metadata** | Read | Granted by default |
 
-No other permissions are needed.
+**Limitation:** Fine-grained PATs can only target repos you own or repos in organizations that have opted in to fine-grained token access. If you are a collaborator on someone else's repo (or an org that hasn't enabled the feature), the repo won't appear in the token creation UI.
+
+#### Classic PAT (required for collaborator/cross-org access)
+
+Use a classic PAT when fine-grained tokens cannot reach the target repository — typically when you are a collaborator on a repo owned by another user or an organization that has not enabled fine-grained token access.
+
+Go to GitHub > **Settings** > **Developer settings** > **Personal access tokens** > **Tokens (classic)**.
+
+| Scope | Reason |
+|-------|--------|
+| `repo` | Full repository access (clone, push, PRs, issues) |
+| `read:org` | Resolve org membership for org-owned repos |
+
+Set an expiration (90 days recommended) and store it in Secrets Manager the same way as a fine-grained token.
+
+#### When to use which
+
+| Scenario | Token type |
+|----------|-----------|
+| Your own repos or your org has fine-grained enabled | Fine-grained |
+| Collaborator on another user's repo | Classic |
+| Org has not opted in to fine-grained tokens | Classic |
+| Targeting repos across multiple orgs | Classic (single token covers all) |
 
 ### AWS Credentials
 
@@ -330,8 +356,8 @@ agent/
 ├── src/                 Agent source modules (pythonpath configured in pyproject.toml)
 │   ├── __init__.py
 │   ├── entrypoint.py    Re-export shim for backward compatibility (tests); delegates to specific modules
-│   ├── config.py        Configuration: build_config(), get_config(), resolve_github_token(), TaskType validation
-│   ├── models.py        Pydantic data models (TaskConfig, RepoSetup, AgentResult, TaskResult, HydratedContext, etc.) and enumerations (TaskType StrEnum)
+│   ├── config.py        Configuration: build_config(), get_config(), resolve_github_token(), resolve_linear_api_token(); resolves the pinned workflow (resolved_workflow / ids like coding/new-task-v1) and validates required inputs per the workflow's requires_repo / read_only / is_pr_workflow (replaced TaskType in #248)
+│   ├── models.py        Pydantic data models (TaskConfig, RepoSetup, AgentResult, TaskResult, HydratedContext, AttachmentConfig, etc.). TaskConfig carries the workflow fields (resolved_workflow, policy_principal, read_only, allowed_tools, requires_repo, is_pr_workflow) that replaced the former TaskType enum (#248)
 │   ├── pipeline.py      Top-level pipeline: main() CLI entry, run_task() orchestration, status resolution, error chaining
 │   ├── runner.py        Agent runner: run_agent() — ClaudeSDKClient connect/query/receive_response
 │   ├── context.py       Context hydration: fetch_github_issue(), assemble_prompt() (local/dry-run only)
@@ -347,16 +373,18 @@ agent/
 │   ├── observability.py OpenTelemetry helpers (e.g. AgentCore session id)
 │   ├── memory.py        Optional memory / episode integration for the agent
 │   ├── system_prompt.py Behavioral contract (PRD Section 11)
-│   └── prompts/         Per-task-type system prompt workflows
-│       ├── __init__.py  Prompt registry — assembles base template + workflow for each task type
-│       ├── base.py      Shared base template (environment, rules, placeholders)
-│       ├── new_task.py  Workflow for new_task (create branch, implement, open PR)
-│       ├── pr_iteration.py  Workflow for pr_iteration (read feedback, address, push)
-│       └── pr_review.py     Workflow for pr_review (read-only analysis, structured review comments)
+│   └── prompts/         System prompt templates, keyed by resolved workflow id (#248)
+│       ├── __init__.py  Prompt registry — get_system_prompt(workflow_id) maps each workflow id to its template; warns + falls back for an unregistered id
+│       ├── base.py      Shared base template for coding workflows (environment, rules, git/branch/PR placeholders)
+│       ├── new_task.py  Workflow fragment for coding/new-task-v1 (create branch, implement, open PR)
+│       ├── pr_iteration.py  Workflow fragment for coding/pr-iteration-v1 (read feedback, address, push)
+│       ├── pr_review.py     Workflow fragment for coding/pr-review-v1 (read-only analysis, structured review comments)
+│       ├── default_agent.py Repo-less prompt for default/agent-v1 (no git/branch/PR; deliverable is the final message)
+│       └── web_research.py  Repo-less research prompt for knowledge/web-research-v1 (WebFetch sourcing, structured cited answer)
 ├── prepare-commit-msg.sh Git hook (Task-Id / Prompt-Version trailers on commits)
 ├── run.sh               Build + run helper for local/server mode with AgentCore constraints
 ├── tests/               pytest unit tests (pythonpath: src/)
-│   ├── test_config.py       Config validation and TaskType tests
+│   ├── test_config.py       Config validation and workflow-resolution tests (requires_repo / read_only / is_pr_workflow, load-failure fallback)
 │   ├── test_hooks.py        PreToolUse hook and hook matcher tests
 │   ├── test_models.py       Pydantic model tests (construction, validation, frozen enforcement, model_dump)
 │   ├── test_policy.py       Cedar policy engine tests (fail-closed, deny-list)

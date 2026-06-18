@@ -21,13 +21,67 @@ import * as crypto from 'crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { createTaskCore } from './shared/create-task-core';
+import { reportIssueFailure } from './shared/linear-feedback';
+import { resolveLinearOauthToken } from './shared/linear-oauth-resolver';
 import { logger } from './shared/logger';
+import type { Attachment } from './shared/types';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
 const PROJECT_MAPPING_TABLE = process.env.LINEAR_PROJECT_MAPPING_TABLE_NAME!;
 const USER_MAPPING_TABLE = process.env.LINEAR_USER_MAPPING_TABLE_NAME!;
+const WORKSPACE_REGISTRY_TABLE = process.env.LINEAR_WORKSPACE_REGISTRY_TABLE_NAME;
 const DEFAULT_LABEL_FILTER = 'bgagent';
+
+/**
+ * Post a Linear comment + ❌ reaction without ever propagating an error.
+ *
+ * Phase 2.0b-O2: feedback is workspace-scoped — the resolver looks up
+ * the per-workspace OAuth token via `LinearWorkspaceRegistryTable` and
+ * issues a Bearer token. If the workspace isn't registered (drop-on-the-floor
+ * for unmapped orgs) the feedback path no-ops cleanly.
+ *
+ * Two failure modes handled here:
+ * - `LINEAR_WORKSPACE_REGISTRY_TABLE_NAME` env var unset (deploy misconfig) —
+ *   skip with a clear diagnostic instead of letting the resolver fail
+ *   per-call.
+ * - `reportIssueFailure` throws synchronously (today impossible thanks to the
+ *   helper's internal `Promise.allSettled`, but a future refactor could
+ *   break that contract). Catching here means a synchronous throw can't
+ *   bubble up and fail the Lambda — which would trigger SQS retries on a
+ *   poison message.
+ */
+async function safeReportIssueFailure(
+  issueId: string,
+  linearWorkspaceId: string | undefined,
+  message: string,
+): Promise<void> {
+  if (!WORKSPACE_REGISTRY_TABLE) {
+    logger.warn('Skipping Linear feedback: LINEAR_WORKSPACE_REGISTRY_TABLE_NAME not set', {
+      issue_id: issueId,
+    });
+    return;
+  }
+  if (!linearWorkspaceId) {
+    logger.warn('Skipping Linear feedback: webhook payload missing organizationId', {
+      issue_id: issueId,
+    });
+    return;
+  }
+  try {
+    await reportIssueFailure(
+      { linearWorkspaceId, registryTableName: WORKSPACE_REGISTRY_TABLE },
+      issueId,
+      message,
+    );
+  } catch (err) {
+    logger.warn('Linear feedback failed (non-fatal)', {
+      issue_id: issueId,
+      linear_workspace_id: linearWorkspaceId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 /** Shape of Linear `Issue` webhook payloads we care about. Undocumented fields are tolerated. */
 interface LinearIssueEvent {
@@ -96,36 +150,38 @@ export async function handler(event: ProcessorEvent): Promise<void> {
 
   const issue = payload.data;
   const projectId = issue.projectId;
-  if (!projectId) {
-    logger.info('Linear Issue has no projectId — skipping (cannot route to a repo)', {
-      issue_id: issue.id,
-    });
-    return;
-  }
 
-  // Look up project → repo mapping.
-  const mapping = await ddb.send(new GetCommand({
-    TableName: PROJECT_MAPPING_TABLE,
-    Key: { linear_project_id: projectId },
-  }));
-  if (!mapping.Item || mapping.Item.status !== 'active') {
-    logger.info('Linear project is not onboarded or is removed — skipping', {
-      linear_project_id: projectId,
-      issue_id: issue.id,
-    });
-    return;
+  // Resolve the per-project label override (if any) BEFORE the label gate so
+  // a workspace using a non-default label name still triggers correctly. The
+  // lookup runs on every Issue webhook (one extra GetItem vs. lookup-after-
+  // projectId-check), which is the price of having the silent label gate
+  // come first — see comment on the `shouldTrigger` block below.
+  let mappingItem: Record<string, unknown> | undefined;
+  if (projectId) {
+    const mapping = await ddb.send(new GetCommand({
+      TableName: PROJECT_MAPPING_TABLE,
+      Key: { linear_project_id: projectId },
+    }));
+    if (mapping.Item && mapping.Item.status === 'active') {
+      mappingItem = mapping.Item;
+    }
   }
-  const repo = mapping.Item.repo as string;
-  const labelFilter = (mapping.Item.label_filter as string | undefined) ?? DEFAULT_LABEL_FILTER;
+  const labelFilter = (mappingItem?.label_filter as string | undefined) ?? DEFAULT_LABEL_FILTER;
 
-  // Only trigger when the configured label is present AND this event is a transition
-  // that meaningfully added/asserts the label — `create` with the label on it, or
-  // `update` that newly added it.
+  // Silent kill-switch: an issue without the trigger label is not for us.
+  // This MUST run before any user-facing comment path. Previously the
+  // projectId-missing and not-onboarded paths ran first and posted
+  // "❌ project isn't onboarded" comments on every Issue event in every
+  // unmapped team — workspace webhooks fire workspace-wide, so a single
+  // un-onboarded team produced dozens of comments per issue change.
+  // Moving the label check first means an unlabeled issue is a true no-op:
+  // no comment, no reaction, no task creation, no DDB writes.
   if (!shouldTrigger(payload, labelFilter)) {
-    logger.info('Linear webhook does not match trigger criteria', {
+    logger.info('Linear webhook does not match trigger criteria — skipping silently', {
       action: payload.action,
       issue_id: issue.id,
       label_filter: labelFilter,
+      has_project_mapping: Boolean(mappingItem),
       current_labels: issue.labels?.map((l) => l?.name),
       updated_from_keys: Object.keys(payload.updatedFrom ?? {}),
       updated_from_label_ids: payload.updatedFrom?.labelIds,
@@ -133,6 +189,34 @@ export async function handler(event: ProcessorEvent): Promise<void> {
     });
     return;
   }
+
+  // From here on the issue is labeled for ABCA, so user-facing failure
+  // comments are appropriate — the user explicitly asked for our attention.
+  if (!projectId) {
+    logger.info('Linear Issue has no projectId — skipping (cannot route to a repo)', {
+      issue_id: issue.id,
+    });
+    await safeReportIssueFailure(
+      issue.id,
+      payload.organizationId,
+      "❌ This Linear issue isn't in a project — ABCA needs a Linear project to route the task to a repo. Move the issue into a project and re-apply the trigger label.",
+    );
+    return;
+  }
+
+  if (!mappingItem) {
+    logger.info('Linear project is not onboarded or is removed — skipping', {
+      linear_project_id: projectId,
+      issue_id: issue.id,
+    });
+    await safeReportIssueFailure(
+      issue.id,
+      payload.organizationId,
+      "❌ This Linear project isn't onboarded to ABCA. An admin can onboard it with `bgagent linear onboard-project <project-uuid> --repo <owner>/<repo> --label <trigger>`.",
+    );
+    return;
+  }
+  const repo = mappingItem.repo as string;
 
   // Resolve the actor → platform user. Fall back to creator if the actor is missing
   // (e.g. automation that set the label). If neither resolves, we cannot attribute
@@ -145,6 +229,11 @@ export async function handler(event: ProcessorEvent): Promise<void> {
       organization_id: workspaceId,
       actor_id: actorId,
     });
+    await safeReportIssueFailure(
+      issue.id,
+      workspaceId,
+      "❌ Linear webhook is missing the organization or actor field — ABCA can't attribute this task to a user. This is unusual; please report it to your ABCA admin.",
+    );
     return;
   }
 
@@ -155,6 +244,11 @@ export async function handler(event: ProcessorEvent): Promise<void> {
       linear_user_id: actorId,
       issue_id: issue.id,
     });
+    await safeReportIssueFailure(
+      issue.id,
+      workspaceId,
+      "❌ This Linear user isn't linked to a platform user. In v1 only the API-token owner can submit tasks from Linear; multi-user OAuth support is on the v3 roadmap.",
+    );
     return;
   }
 
@@ -172,11 +266,41 @@ export async function handler(event: ProcessorEvent): Promise<void> {
     channelMetadata.linear_team_id = issue.teamId;
   }
 
+  // Phase 2.0b-O2: resolve the workspace's OAuth secret ARN ONCE here
+  // and stash it on the task record. The agent runtime reads it directly
+  // (no registry lookup at task-execution time).
+  //
+  // When the registry table IS configured but resolution returns null —
+  // workspace not in registry, status not active, or token unreadable —
+  // the receiver only let this through because the stack-wide fallback
+  // verified. Creating a task against a workspace ABCA doesn't recognize
+  // is the wrong behaviour: outbound Linear comments would silently
+  // skip, the user mapping lookup would fail, and we'd burn agent
+  // quota for no observable result. Drop the event explicitly here
+  // rather than rely on downstream lookups to incidentally block it.
+  if (WORKSPACE_REGISTRY_TABLE) {
+    const resolved = await resolveLinearOauthToken(workspaceId, WORKSPACE_REGISTRY_TABLE);
+    if (!resolved) {
+      logger.warn('Linear workspace not resolvable from registry — dropping event', {
+        linear_workspace_id: workspaceId,
+        issue_id: issue.id,
+      });
+      return;
+    }
+    channelMetadata.linear_oauth_secret_arn = resolved.oauthSecretArn;
+    channelMetadata.linear_workspace_slug = resolved.workspaceSlug;
+  }
+
+  // Extract embedded image URLs from the issue description markdown.
+  // These become URL attachments that are fetched and screened during context hydration.
+  const attachments = extractImageUrlAttachments(issue.description);
+
   const requestId = crypto.randomUUID();
   const result = await createTaskCore(
     {
       repo,
       task_description: taskDescription,
+      ...(attachments.length > 0 && { attachments }),
     },
     {
       userId: platformUserId,
@@ -192,6 +316,11 @@ export async function handler(event: ProcessorEvent): Promise<void> {
       body: result.body,
       issue_id: issue.id,
     });
+    await safeReportIssueFailure(
+      issue.id,
+      workspaceId,
+      buildCreateTaskFailureMessage(result.statusCode, result.body),
+    );
     return;
   }
 
@@ -236,6 +365,44 @@ function shouldTrigger(payload: LinearIssueEvent, labelFilter: string): boolean 
   return false;
 }
 
+/**
+ * Translate a `createTaskCore` non-201 response into a user-facing Linear comment.
+ *
+ * The CDK error envelope is `{ error: { code, message, request_id } }`. We surface
+ * the `message` because it's already user-readable (e.g. "Task description was
+ * blocked by content policy") and add a per-status prefix so the user can tell
+ * a guardrail block from a 503 from a validation error.
+ *
+ * Falls back to a generic message if the body fails to parse — best-effort, never throws.
+ */
+function buildCreateTaskFailureMessage(statusCode: number, rawBody: string): string {
+  let detail = '';
+  try {
+    if (rawBody) {
+      const parsed = JSON.parse(rawBody) as { error?: { code?: string; message?: string } };
+      const message = parsed.error?.message;
+      if (typeof message === 'string' && message.trim()) {
+        detail = message.trim();
+      }
+    }
+  } catch {
+    // fall through to the generic message
+  }
+
+  if (statusCode === 400 && detail) {
+    // Guardrail blocks and validation errors land here; the message is already
+    // user-readable so just prefix it.
+    return `❌ ABCA couldn't accept this task: ${detail}`;
+  }
+  if (statusCode === 503) {
+    return `❌ ABCA is temporarily unavailable (status ${statusCode}). Please re-apply the trigger label in a few minutes.`;
+  }
+  if (detail) {
+    return `❌ ABCA couldn't create this task (status ${statusCode}): ${detail}`;
+  }
+  return `❌ ABCA couldn't create this task (status ${statusCode}). Check the ABCA admin logs for details.`;
+}
+
 function buildTaskDescription(issue: LinearIssueEvent['data']): string {
   const parts: string[] = [];
   if (issue.identifier && issue.title) {
@@ -248,6 +415,35 @@ function buildTaskDescription(issue: LinearIssueEvent['data']): string {
     parts.push(issue.description.trim());
   }
   return parts.join('\n') || 'Linear issue';
+}
+
+/**
+ * Extract image URL attachments from Linear issue description markdown.
+ *
+ * Scans for standard markdown image references: `![alt](url)`.
+ * Only HTTPS URLs are included (security: no HTTP, no data: URIs).
+ * Capped at 10 images per issue to stay within attachment limits.
+ */
+function extractImageUrlAttachments(description: string | undefined): Attachment[] {
+  if (!description) return [];
+
+  const imagePattern = /!\[[^\]]*\]\((https:\/\/[^)]+)\)/g;
+  const attachments: Attachment[] = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = imagePattern.exec(description)) !== null) {
+    if (attachments.length >= 10) break;
+    const url = match[1];
+    attachments.push({ type: 'url', url });
+  }
+
+  if (attachments.length > 0) {
+    logger.info('Extracted image URL attachments from Linear issue description', {
+      count: attachments.length,
+    });
+  }
+
+  return attachments;
 }
 
 async function lookupPlatformUser(workspaceId: string, userId: string): Promise<string | null> {

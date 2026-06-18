@@ -32,6 +32,7 @@ Guidelines:
 - If you change API types in `cdk/src/handlers/shared/types.ts`, update `cli/src/types.ts` to match.
 - If you change docs sources (`docs/guides/`, `docs/design/`), run `mise //docs:sync` so generated content stays in sync.
 - For significant features, add a design document to `docs/design/`.
+- For cross-cutting or hard-to-reverse decisions, add an ADR to `docs/decisions/` (see [ADR README](/architecture/readme)).
 
 ### 4. Commit
 
@@ -57,6 +58,7 @@ Rules:
 - The PR title and description become the squash commit message, so keep them accurate throughout the review.
 - The CI workflow runs `mise run install` then `mise run build` (compile + lint + test + synth + security scans for all packages).
 - Iterate on review feedback by pushing new commits to the same branch. Maintainers squash-merge when approved.
+- For structured reviews (human or agent), use the [`review_pr` command](https://github.com/aws-samples/sample-autonomous-cloud-coding-agents/blob/main/.abca/commands/review_pr.md) — including the **human review heuristics** (Proportionality, Coherence, Clarity, Appropriateness) for smell dimensions automation cannot catch.
 
 ### PR checklist
 
@@ -81,8 +83,15 @@ Common commands:
 | `mise //cli:build` | CLI only: compile + test + lint |
 | `mise //docs:build` | Docs only: sync sources + Astro build |
 | `mise run hooks:run` | Run pre-commit and pre-push checks locally |
+| `mise run upgrade` | Upgrade dependencies within declared ranges (Yarn workspaces + agent `uv.lock`) |
 
 Set `export MISE_EXPERIMENTAL=1` for namespaced tasks like `mise //cdk:build`.
+
+### Dependency upgrades
+
+The `upgrade-main` GitHub workflow runs `mise run upgrade` daily and opens a PR labeled `auto-approve` when lockfiles change. Upgrades stay within the ranges declared in each manifest — exact pins are never rewritten, which keeps the Cedar engine parity pair (`cedarpy` / `@cedar-policy/cedar-wasm`) untouched; those move only together, by hand, with refreshed parity fixtures.
+
+PRs labeled `auto-approve` are approved automatically by the `auto-approve` workflow; only apply the label to automated PRs whose changes are gated by the full build (e.g. the dependency-upgrade PRs).
 
 ### Git hooks
 

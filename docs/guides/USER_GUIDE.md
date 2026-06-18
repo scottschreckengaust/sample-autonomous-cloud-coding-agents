@@ -4,15 +4,33 @@
 
 ABCA is a platform for running autonomous background coding agents on AWS. You submit a task (a GitHub repository + a task description or issue number), an agent works autonomously in an isolated environment, and delivers a pull request when done. This guide covers how to submit coding tasks, monitor their progress, and get the most out of the platform.
 
-There are five ways to interact with the platform. You can use them independently or combine them for different workflows:
+There are six ways to interact with the platform. You can use them independently or combine them for different workflows:
 
 1. **CLI** (recommended) - The `bgagent` CLI authenticates via Cognito and calls the Task API. Best for individual developers submitting tasks from the terminal. Handles login, token caching, and output formatting.
 2. **REST API** (direct) - Call the Task API endpoints directly with a JWT token. Best for building custom integrations, dashboards, or internal tools on top of the platform. Full validation, audit logging, and idempotency support.
 3. **Webhook** - External systems (CI pipelines, GitHub Actions) can create tasks via HMAC-authenticated HTTP requests. Best for automated workflows where tasks should be triggered by events (e.g., a new issue is labeled, a PR needs review). No Cognito credentials needed; uses a shared secret per integration.
 4. **Slack** - Submit tasks by @mentioning the bot and receive threaded progress notifications with reaction-based status. See the [Slack setup guide](./SLACK_SETUP_GUIDE.md).
 5. **Linear** - Apply a label to a Linear issue to trigger a task; the agent posts progress comments back on the issue via Linear's MCP server. See the [Linear setup guide](./LINEAR_SETUP_GUIDE.md).
+6. **Jira** - Add a label to a Jira Cloud issue to trigger a task; the agent posts progress comments back on the issue via the Jira REST v3 API. See the [Jira setup guide](./JIRA_SETUP_GUIDE.md).
 
-For example, a team might use the **CLI** for ad-hoc tasks, **webhooks** to auto-trigger `pr_review` on every new PR via GitHub Actions, **Slack** for quick team-wide requests, **Linear** for tickets that already live in the PM tool, and the **REST API** to build a dashboard that tracks task status across repositories.
+For example, a team might use the **CLI** for ad-hoc tasks, **webhooks** to auto-trigger `coding/pr-review-v1` on every new PR via GitHub Actions, **Slack** for quick team-wide requests, **Linear** or **Jira** for tickets that already live in the PM tool, and the **REST API** to build a dashboard that tracks task status across repositories.
+
+## Roles
+
+ABCA is a **shared-stack-per-organization** platform — one CDK deployment, used by everyone on the team. Like a self-hosted GitLab or Linear instance: one company → one stack → many users. You generally do **not** run your own deployment to use someone else's; you join theirs as a Cognito user.
+
+There are four lifecycle roles. They are often the same person early on, but the operations they perform are distinct:
+
+| Role | What they do | Frequency |
+|------|--------------|-----------|
+| **Stack admin** | `cdk deploy` the stack; rotates platform-level secrets; runs `bgagent admin invite-user` to onboard teammates | Once + occasional |
+| **Linear / Slack workspace admin** | Runs `bgagent linear setup` (or `bgagent slack setup`) once per workspace to install the OAuth app | One-time per workspace |
+| **Repo onboarder** | Runs `bgagent linear onboard-project` (or registers a Blueprint via CDK) to wire a repo into the platform | As needed; any authenticated user |
+| **Teammate** | Runs `bgagent configure` once + `bgagent submit` / Linear-label / Slack mention from then on | Daily user |
+
+If you're a teammate joining an existing deployment, jump to [Joining an existing deployment](#joining-an-existing-deployment) below.
+
+If you're standing up a new deployment from scratch, see the [Developer guide](./DEVELOPER_GUIDE.md) first, then come back here for the [admin onboarding flow](#get-stack-outputs).
 
 ## Prerequisites
 
@@ -53,7 +71,7 @@ flowchart TB
 
 1. **Authenticate** - The user sends username and password to Amazon Cognito via the CLI (`bgagent login`) or the AWS SDK (`initiate-auth`).
 2. **Receive token** - Cognito validates credentials and returns a JWT ID token. The CLI caches it locally (`~/.bgagent/credentials.json`) and auto-refreshes on expiry.
-3. **Call the API** - Every request includes the token in the `Authorization: Bearer <token>` header.
+3. **Call the API** - Every request includes the raw ID token (no `Bearer` prefix) in the `Authorization: <token>` header.
 4. **Validate** - API Gateway's Cognito authorizer verifies the JWT signature, expiration, and audience. Invalid tokens are rejected with `401`.
 5. **Extract identity** - The Lambda handler reads the `sub` claim from the validated JWT and uses it as `user_id` for task ownership and audit.
 
@@ -63,6 +81,49 @@ flowchart TB
 2. **Check webhook exists** - A Lambda REQUEST authorizer verifies that the webhook ID exists and is active in DynamoDB. Revoked or unknown webhooks are rejected with `403`.
 3. **Verify signature** - The handler fetches the webhook's shared secret from AWS Secrets Manager, computes `HMAC-SHA256(secret, raw_request_body)`, and compares it to the provided signature using constant-time comparison (`crypto.timingSafeEqual`). Mismatches are rejected with `403`.
 4. **Extract identity** - The `user_id` is the Cognito user who originally created the webhook integration. Tasks created via webhook are owned by that user.
+
+### Joining an existing deployment
+
+If your team already has ABCA deployed and someone (the "stack admin") has invited you, this is your path. You will **not** run `cdk deploy`, will **not** run `bgagent linear setup`, and will not need AWS credentials. You're a tenant on a shared deployment.
+
+Three steps:
+
+1. **Get a config bundle from your admin.** They run `bgagent admin invite-user your-email@example.com` and send you the output via Slack / 1Password / email. The output looks like:
+
+   ```
+   ✓ Created Cognito user your-email@example.com
+   ✓ Set permanent password (no first-login change required)
+
+   Share with the new teammate:
+   ────────────────────────────────────────────────────────────────
+     email:    your-email@example.com
+     password: K9$mPq2nL!vXf3Hb
+     bundle:   eyJhcGlfdXJsIjoiaHR0cHM6Ly9hYmMxMjM…
+   ────────────────────────────────────────────────────────────────
+   ```
+
+   The `bundle` is a base64 blob carrying the four config fields (API URL, region, user pool ID, app client ID) so you don't have to type them as separate flags.
+
+2. **Configure your CLI from the bundle:**
+
+   ```bash
+   bgagent configure --from-bundle <paste the base64 string>
+   ```
+
+3. **Log in with the temp password:**
+
+   ```bash
+   bgagent login --username your-email@example.com
+   # paste the temp password
+   ```
+
+   The CLI caches your tokens in `~/.bgagent/credentials.json` and auto-refreshes them.
+
+You're in. `bgagent submit`, `bgagent list`, `bgagent status` work against the shared stack. Tasks you submit are attributed to your Cognito user; concurrency caps and budgets are scoped to you.
+
+**You do not run** `bgagent linear setup`, `bgagent jira setup`, or `bgagent slack setup` — those are workspace-level operations performed once by the stack/workspace admin. If you want Linear- or Jira-triggered tasks to be attributed to *you* (not auto-dropped), the admin needs to map your Linear identity or Jira account to your Cognito user; ask them about [Linear user linking](./LINEAR_SETUP_GUIDE.md#inviting-teammates) or [Jira user linking](./JIRA_SETUP_GUIDE.md#5-link-your-jira-identity).
+
+If something looks broken (commands fail with `Not configured` or `401 Unauthorized`), re-paste the bundle and re-run `bgagent login`. The bundle holds no secrets — your password (separate) is the credential.
 
 ### Get stack outputs
 
@@ -82,14 +143,35 @@ APP_CLIENT_ID=$(aws cloudformation describe-stacks --stack-name backgroundagent-
   --query 'Stacks[0].Outputs[?OutputKey==`AppClientId`].OutputValue' --output text)
 ```
 
-### Create a user (admin)
+### Invite a teammate (admin)
+
+```bash
+bgagent admin invite-user teammate@example.com
+```
+
+This wraps Cognito `admin-create-user` + `admin-set-user-password` with the right defaults (email-verified, password set as permanent so the teammate doesn't hit a password-change flow on first login, suppress-email so SES isn't required) and prints a shareable config bundle plus an auto-generated strong temp password. Send the bundle + password to the teammate; they paste them into `bgagent configure --from-bundle <bundle>` + `bgagent login --username <email>` and they're in.
+
+The CLI command requires the running shell to have AWS credentials with `cognito-idp:AdminCreateUser` and `cognito-idp:AdminSetUserPassword` on the configured user pool — i.e. you're acting as the stack admin, not as a Cognito-authenticated end-user.
+
+**Pool constraints** (enforced server-side; the CLI handles them, but useful to know if you ever need to bypass it with raw AWS CLI):
+
+- **Username MUST be an email address.** The pool is configured with email as the sign-in alias.
+- **Password policy**: minimum 12 characters, with at least one uppercase, lowercase, digit, and symbol.
+- **`email_verified=true` attribute is required**, otherwise the account stays in `FORCE_CHANGE_PASSWORD` state and `initiate-auth` fails with `User is not confirmed`.
+- **`--message-action SUPPRESS`** stops Cognito from trying to email the temp password — required unless you've set up SES verified identities.
+
+#### Raw AWS CLI fallback
+
+If you can't run `bgagent admin invite-user` (e.g., you're scripting this from CI without the CLI installed), the underlying calls are:
 
 ```bash
 aws cognito-idp admin-create-user \
   --region "$REGION" \
   --user-pool-id $USER_POOL_ID \
   --username user@example.com \
-  --temporary-password 'TempPass123!@'
+  --user-attributes Name=email,Value=user@example.com Name=email_verified,Value=true \
+  --temporary-password 'TempPass123!@' \
+  --message-action SUPPRESS
 
 aws cognito-idp admin-set-user-password \
   --region "$REGION" \
@@ -99,7 +181,7 @@ aws cognito-idp admin-set-user-password \
   --permanent
 ```
 
-Password requirements: minimum 12 characters, uppercase, lowercase, digits, and symbols.
+The first command creates the user with a temporary password and pre-verifies the email. The second sets a permanent password so the teammate does not have to go through a password change flow on first login. After running these, hand the teammate the four config fields manually (or build the bundle: `echo '{"api_url":"…","region":"…","user_pool_id":"…","client_id":"…"}' | base64`).
 
 ### Obtain a JWT token
 
@@ -148,44 +230,48 @@ Blueprints can configure per-repository settings that override platform defaults
 
 When you specify `--max-turns` (CLI) or `max_turns` (API) on a task, your value takes precedence over the Blueprint default. If neither is specified, the platform default (100) is used. The same override pattern applies to `--max-budget` / `max_budget_usd`, except there is no platform default  - if neither the task nor the Blueprint specifies a budget, no cost limit is applied.
 
-## Task types
+## Workflows
 
-The platform supports three task types that cover the full lifecycle of a code change:
+Every task runs a **workflow** — a named, versioned recipe that decides whether to clone a repo, which tools the agent may use, and how the result is delivered. You select one with `workflow_ref` (REST/webhook) or `--workflow` (CLI); the `--pr`/`--review-pr` flags select the coding PR workflows for you. If you specify nothing, the platform resolves a default (your repo's Blueprint default, or the conservative `default/agent-v1`). Workflows replace the old `task_type` field — see [Workflows](../design/WORKFLOWS.md) for the full design and how to author your own.
 
-| Type | Description | Outcome |
+The shipped workflows that cover the full lifecycle of a code change:
+
+| Workflow | Description | Outcome |
 |---|---|---|
-| `new_task` (default) | Create a new branch, implement changes, and open a new PR. | New pull request |
-| `pr_iteration` | Check out an existing PR's branch, read review feedback, address it, and push updates. | Updated pull request |
-| `pr_review` | Check out an existing PR's branch, analyze the changes read-only, and post a structured review. | Review comments on the PR |
+| `coding/new-task-v1` | Create a new branch, implement changes, and open a new PR. | New pull request |
+| `coding/pr-iteration-v1` | Check out an existing PR's branch, read review feedback, address it, and push updates. | Updated pull request |
+| `coding/pr-review-v1` | Check out an existing PR's branch, analyze the changes read-only, and post a structured review. | Review comments on the PR |
+| `knowledge/web-research-v1` | Research a question from the task description and attachments (no repo required), delivering a written result. | Research artifact |
+| `default/agent-v1` | The conservative fallback when nothing else is selected: run the request through a read-leaning agent and deliver the result. No repo, build, or PR assumptions. | Artifact |
 
-### When to use each type
+### When to use each coding workflow
 
-**`new_task`** - You have a feature request, bug report, or task description and want the agent to implement it from scratch. The agent creates a fresh branch, writes code, runs tests, and opens a new PR. Use this for greenfield work: adding features, fixing bugs, writing tests, refactoring, or updating documentation.
+**`coding/new-task-v1`** (the mapping target for the old `new_task`) - You have a feature request, bug report, or task description and want the agent to implement it from scratch. The agent creates a fresh branch, writes code, runs tests, and opens a new PR. Use this for greenfield work: adding features, fixing bugs, writing tests, refactoring, or updating documentation. Submitted via the CLI with `--issue`/`--task` and no PR flag.
 
-**`pr_iteration`** - A reviewer left feedback on an existing PR and you want the agent to address it. The agent reads the review comments, makes targeted changes, and pushes to the same branch. Use this to accelerate the review-fix-push cycle without context-switching from your current work.
+**`coding/pr-iteration-v1`** (CLI `--pr`) - A reviewer left feedback on an existing PR and you want the agent to address it. The agent reads the review comments, makes targeted changes, and pushes to the same branch. Use this to accelerate the review-fix-push cycle without context-switching from your current work.
 
-**`pr_review`** - You want a structured code review of an existing PR before a human reviewer looks at it. The agent reads the changes and posts review comments without modifying code. Use this as a first-pass review to catch issues early, especially for large PRs or when reviewers are busy.
+**`coding/pr-review-v1`** (CLI `--review-pr`) - You want a structured code review of an existing PR before a human reviewer looks at it. The agent reads the changes and posts review comments without modifying code. Use this as a first-pass review to catch issues early, especially for large PRs or when reviewers are busy.
 
-### Combining task types
+### Combining coding workflows
 
-The three task types work together as a development loop:
+The three coding workflows work together as a development loop:
 
 ```mermaid
 flowchart LR
-    A[new_task] --> B[PR opened]
-    B --> C[pr_review]
+    A[coding/new-task-v1] --> B[PR opened]
+    B --> C[coding/pr-review-v1]
     C --> D{Approved?}
-    D -- No --> E[pr_iteration]
+    D -- No --> E[coding/pr-iteration-v1]
     E --> C
     D -- Yes --> F[Merge]
 ```
 
-1. Submit a `new_task` - the agent implements the change and opens a PR.
-2. Submit a `pr_review` on the new PR - the agent posts structured review comments.
-3. Submit a `pr_iteration` - the agent addresses the review feedback and pushes updates.
+1. Submit a `coding/new-task-v1` task - the agent implements the change and opens a PR.
+2. Submit a `coding/pr-review-v1` task on the new PR - the agent posts structured review comments.
+3. Submit a `coding/pr-iteration-v1` task - the agent addresses the review feedback and pushes updates.
 4. Repeat steps 2-3 until the PR is ready to merge.
 
-You can automate this loop with webhooks: trigger `pr_review` automatically when a PR is opened, and `pr_iteration` when review comments are posted.
+You can automate this loop with webhooks: trigger `coding/pr-review-v1` automatically when a PR is opened, and `coding/pr-iteration-v1` when review comments are posted.
 
 ## Using the REST API
 
@@ -193,7 +279,7 @@ The Task API exposes 5 endpoints under the base URL from the `ApiUrl` stack outp
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/tasks` | Create a new task (new_task, pr_iteration, or pr_review) |
+| `POST` | `/tasks` | Create a new task (selects a workflow via `workflow_ref`, or resolves a default) |
 | `GET` | `/tasks` | List your tasks with optional filters (status, repo, pagination) |
 | `GET` | `/tasks/{task_id}` | Get full detail for a specific task |
 | `DELETE` | `/tasks/{task_id}` | Cancel a running or queued task |
@@ -239,16 +325,16 @@ To iterate on an existing pull request (address review feedback):
 curl -X POST "$API_URL/tasks" \
   -H "Authorization: $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"repo": "owner/repo", "task_type": "pr_iteration", "pr_number": 42}'
+  -d '{"repo": "owner/repo", "workflow_ref": "coding/pr-iteration-v1", "pr_number": 42}'
 ```
 
-You can optionally include `task_description` with `pr_iteration` to provide additional instructions alongside the review feedback:
+You can optionally include `task_description` with `coding/pr-iteration-v1` to provide additional instructions alongside the review feedback:
 
 ```bash
 curl -X POST "$API_URL/tasks" \
   -H "Authorization: $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"repo": "owner/repo", "task_type": "pr_iteration", "pr_number": 42, "task_description": "Focus on the null check Alice flagged in the auth module"}'
+  -d '{"repo": "owner/repo", "workflow_ref": "coding/pr-iteration-v1", "pr_number": 42, "task_description": "Focus on the null check Alice flagged in the auth module"}'
 ```
 
 To request a read-only review of an existing pull request:
@@ -257,17 +343,19 @@ To request a read-only review of an existing pull request:
 curl -X POST "$API_URL/tasks" \
   -H "Authorization: $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"repo": "owner/repo", "task_type": "pr_review", "pr_number": 55}'
+  -d '{"repo": "owner/repo", "workflow_ref": "coding/pr-review-v1", "pr_number": 55}'
 ```
 
-You can optionally include `task_description` with `pr_review` to focus the review on specific areas:
+You can optionally include `task_description` with `coding/pr-review-v1` to focus the review on specific areas:
 
 ```bash
 curl -X POST "$API_URL/tasks" \
   -H "Authorization: $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"repo": "owner/repo", "task_type": "pr_review", "pr_number": 55, "task_description": "Focus on security implications and error handling"}'
+  -d '{"repo": "owner/repo", "workflow_ref": "coding/pr-review-v1", "pr_number": 55, "task_description": "Focus on security implications and error handling"}'
 ```
+
+> **Selecting a workflow.** `workflow_ref` chooses which workflow runs the task, in the form `<id>[@<constraint>]` (e.g. `coding/new-task-v1`). It replaced the old `task_type` field (see [Workflows](../design/WORKFLOWS.md)). Omit it and the platform resolves a default — the repo's Blueprint default if configured, otherwise the conservative `default/agent-v1`. The one-to-one mapping from the retired `task_type` values is `new_task → coding/new-task-v1`, `pr_iteration → coding/pr-iteration-v1`, `pr_review → coding/pr-review-v1`.
 
 **Request body fields:**
 
@@ -276,12 +364,12 @@ curl -X POST "$API_URL/tasks" \
 | `repo` | string | Yes | GitHub repository in `owner/repo` format |
 | `issue_number` | number | One of these | GitHub issue number |
 | `task_description` | string | is required | Free-text task description |
-| `pr_number` | number | | PR number to iterate on or review (required for `pr_iteration` and `pr_review`) |
-| `task_type` | string | No | `new_task` (default), `pr_iteration`, or `pr_review`. |
+| `pr_number` | number | | PR number to iterate on or review (required for `coding/pr-iteration-v1` and `coding/pr-review-v1`) |
+| `workflow_ref` | string | No | Workflow selector `<id>[@<constraint>]` (e.g. `coding/new-task-v1`). Replaces the retired `task_type`. Omitted ⇒ the platform resolves a default (`default/agent-v1`). |
 | `max_turns` | number | No | Maximum agent turns (1–500). Overrides the per-repo Blueprint default. Platform default: 100. |
 | `max_budget_usd` | number | No | Maximum cost budget in USD (0.01–100). When reached, the agent stops regardless of remaining turns. Overrides the per-repo Blueprint default. If omitted, no budget limit is applied. |
 
-**Content screening:** Task descriptions are automatically screened by Amazon Bedrock Guardrails for prompt injection before the task is created. If content is blocked, you receive a `400 GUARDRAIL_BLOCKED` error  - revise the description and retry. If the screening service is temporarily unavailable, you receive a `503` error  - retry after a short delay. For PR tasks (`pr_iteration`, `pr_review`), the assembled prompt (including PR body and review comments) is also screened during context hydration; if blocked, the task transitions to `FAILED`.
+**Content screening:** Task descriptions are automatically screened by Amazon Bedrock Guardrails for prompt injection before the task is created. If content is blocked, you receive a `400 VALIDATION_ERROR` ("Task description was blocked by content policy.")  - revise the description and retry. If the screening service is temporarily unavailable, you receive a `503` error  - retry after a short delay. For PR workflows (`coding/pr-iteration-v1`, `coding/pr-review-v1`), the assembled prompt (including PR body and review comments) is also screened during context hydration; if blocked, the task transitions to `FAILED`.
 
 **Idempotency:** Include an `Idempotency-Key` header (alphanumeric, dashes, underscores, max 128 chars) to prevent duplicate task creation on retries:
 
@@ -393,6 +481,18 @@ node lib/bin/bgagent.js submit --repo owner/repo --review-pr 55
 # Review a PR with a specific focus area
 node lib/bin/bgagent.js submit --repo owner/repo --review-pr 55 --task "Focus on security and error handling"
 
+# Select an explicit workflow (overrides the one --pr/--review-pr would imply)
+node lib/bin/bgagent.js submit --repo owner/repo --task "Research the tradeoffs" --workflow knowledge/web-research-v1
+
+# Submit with attachments (local files)
+node lib/bin/bgagent.js submit --repo owner/repo --task "Fix this bug" \
+  --attachment screenshot.png \
+  --attachment error.log
+
+# Submit with a URL attachment
+node lib/bin/bgagent.js submit --repo owner/repo --task "Implement this design" \
+  --attachment https://figma.com/file/abc123/export.png
+
 # Submit and wait for completion
 node lib/bin/bgagent.js submit --repo owner/repo --issue 42 --wait
 ```
@@ -419,16 +519,73 @@ Created:     2026-04-01T00:39:51.271Z
 | `--repo` | GitHub repository (`owner/repo`). Required. |
 | `--issue` | GitHub issue number. |
 | `--task` | Task description text. |
-| `--pr` | PR number to iterate on. Sets task type to `pr_iteration`. The agent checks out the PR's branch, reads review feedback, and pushes updates. |
-| `--review-pr` | PR number to review. Sets task type to `pr_review`. The agent checks out the PR's branch, analyzes changes read-only, and posts structured review comments. |
+| `--pr` | PR number to iterate on. Selects the `coding/pr-iteration-v1` workflow. The agent checks out the PR's branch, reads review feedback, and pushes updates. |
+| `--review-pr` | PR number to review. Selects the `coding/pr-review-v1` workflow. The agent checks out the PR's branch, analyzes changes read-only, and posts structured review comments. |
+| `--workflow` | Workflow to run, as `<id>[@<constraint>]` (e.g. `coding/new-task-v1`). Overrides the workflow implied by `--pr`/`--review-pr`; omit to let the server resolve a default. |
+| `--attachment` | Attach a file or URL (repeatable). Local files ≤ 500 KB are sent inline; larger files use presigned upload. URLs are fetched during hydration. See [Attachments](#attachments) below. |
 | `--max-turns` | Maximum agent turns (1–500). Overrides per-repo Blueprint default. Platform default: 100. |
 | `--max-budget` | Maximum cost budget in USD (0.01–100). Overrides per-repo Blueprint default. No default limit. |
 | `--idempotency-key` | Idempotency key for deduplication. |
 | `--trace` | Enable detailed tracing: raises progress preview cap to 4 KB and uploads full NDJSON trajectory to S3 on completion. Download with `bgagent trace download`. |
+| `--approval-timeout` | Cedar HITL per-task approval timeout in seconds (default 300). A matching rule with its own `@approval_timeout_s` annotation still takes the minimum. See [Approval gates](#approval-gates-cedar-hitl). |
+| `--pre-approve` | Cedar HITL scope to approve up-front (repeatable). Same scope forms as `bgagent approve --scope`. Hard-deny rules are always enforced. |
 | `--wait` | Poll until the task reaches a terminal status. |
 | `--output` | Output format: `text` (default) or `json`. |
 
 At least one of `--issue`, `--task`, `--pr`, or `--review-pr` is required. The `--pr` and `--review-pr` flags are mutually exclusive.
+
+### Attachments
+
+Attachments let you provide non-text context to the agent — screenshots of bugs, design mockups, CSV data, log files, or URLs to external resources. Every attachment passes through security screening before reaching the agent.
+
+**Supported file types:**
+
+| Category | Types | Extensions |
+|---|---|---|
+| Images | PNG, JPEG | `.png`, `.jpg` |
+| Text files | Plain text, CSV, Markdown, JSON, PDF, Log | `.txt`, `.csv`, `.md`, `.json`, `.pdf`, `.log` |
+
+**Limits:**
+
+| Limit | Value |
+|---|---|
+| Max attachments per task | 10 |
+| Max size per attachment | 10 MB |
+| Max total size per task | 50 MB |
+| URL attachments | HTTPS only |
+
+**Usage:**
+
+```bash
+# Local file (auto-detects MIME type from content)
+node lib/bin/bgagent.js submit --repo owner/repo --task "Fix this layout" \
+  --attachment screenshot.png
+
+# Multiple attachments
+node lib/bin/bgagent.js submit --repo owner/repo --task "Analyze these logs" \
+  --attachment error.log \
+  --attachment metrics.csv
+
+# URL attachment (fetched during task hydration)
+node lib/bin/bgagent.js submit --repo owner/repo --task "Implement this design" \
+  --attachment https://example.com/mockup.png
+```
+
+The CLI automatically routes attachments through the optimal upload path:
+
+- **Files ≤ 500 KB** are sent inline (base64-encoded in the request body).
+- **Files > 500 KB** use presigned upload (uploaded directly to S3, then confirmed).
+- **URLs** are validated at submission and fetched during context hydration with SSRF protection.
+
+**Security screening:**
+
+All attachments are screened before reaching the agent:
+
+- **Images**: Magic bytes validation, dimension checks (max 8000px per side), Bedrock Guardrail content screening (prompt attack detection). Only PNG and JPEG are accepted.
+- **Text files**: Magic bytes validation, Bedrock Guardrail text content screening. PDFs have text extracted (max 50 pages) before screening.
+- **URLs**: HTTPS-only enforcement, DNS resolution pinning (prevents DNS rebinding/SSRF), private IP blocking, redirect validation, size and timeout limits.
+
+If any attachment fails screening, the entire task is rejected with a clear error identifying the problematic file. Re-submit without the flagged attachment.
 
 ### Checking task status
 
@@ -544,6 +701,112 @@ node lib/bin/bgagent.js --verbose submit --repo owner/repo --task "Fix the bug"
 node lib/bin/bgagent.js cancel <TASK_ID>
 ```
 
+## Approval gates (Cedar HITL)
+
+The platform evaluates every tool call the agent is about to make (Bash, Write, Edit, WebFetch, ...) against a Cedar policy set. Most calls resolve to a plain **Allow** or **Deny** with no human involvement. For a small, explicitly-marked set of rules, the decision is **require-approval**: the agent pauses, the task transitions to `AWAITING_APPROVAL`, and you are asked to make the call.
+
+The mechanism is Cedar HITL gates — "Human-In-The-Loop." It is the same policy language you can already author at the blueprint level, with one added annotation (`@tier("soft")`) that flips a rule from hard-deny to require-approval.
+
+For the full design and guarantees (atomicity, fail-closed posture, timeout semantics, late-approval handling), see [Cedar HITL gates design doc](../design/CEDAR_HITL_GATES.md). For writing policies, see the [Cedar policy guide](./CEDAR_POLICY_GUIDE.md).
+
+### When a gate fires
+
+When a rule marked `@tier("soft")` matches a tool call:
+
+1. The agent stops before invoking the tool.
+2. A row is atomically written to the approvals table and the task status flips to `AWAITING_APPROVAL`.
+3. A progress event (`approval_requested`) is emitted so `bgagent watch` shows the gate in real time.
+4. The task waits for your decision up to the rule's timeout (default 300 s, configurable per-rule and per-task).
+5. On approval, the agent proceeds; on denial, the deny reason is best-effort injected back into the agent's context so it can adapt; on timeout, the gate is treated as a denial with `timed_out` as the reason.
+
+A decision is recorded at most once per request. Replaying approve/deny on the same `(task_id, request_id)` is idempotent.
+
+### Listing pending approvals
+
+```bash
+node lib/bin/bgagent.js pending
+```
+
+Lists every approval across your tasks that is currently awaiting your decision. The default text output gives you the `request_id`, tool, severity, the reason the rule matched, the tool-input preview, the expiry time, and ready-to-run `approve` / `deny` command lines. Pipe through `--output json` for scripting.
+
+```text
+1 pending approval(s):
+
+  task_id:    01KN37PZ77P1W19D71DTZ15X6X
+  request_id: 01R...
+  tool:       Bash    severity: high
+  reason:     Bash command matches force-push pattern
+  rules:      force_push_any
+  preview:    git push --force origin feature/xyz
+  created:    2026-05-13T12:04:12Z
+  expires:    2026-05-13T12:09:12Z (timeout_s=300)
+  approve:    bgagent approve 01KN37PZ77P1W19D71DTZ15X6X 01R...
+  deny:       bgagent deny 01KN37PZ77P1W19D71DTZ15X6X 01R... --reason "..."
+```
+
+### Approving a gate
+
+```bash
+node lib/bin/bgagent.js approve <TASK_ID> <REQUEST_ID>
+node lib/bin/bgagent.js approve <TASK_ID> <REQUEST_ID> --scope tool_type:Bash
+node lib/bin/bgagent.js approve <TASK_ID> <REQUEST_ID> --scope rule:force_push_any
+node lib/bin/bgagent.js approve <TASK_ID> <REQUEST_ID> --scope all_session --yes
+```
+
+The `--scope` flag controls how long the approval carries forward within the running task:
+
+| Scope | Effect |
+|---|---|
+| `this_call` | Default. Approves only the exact tool call that is waiting. The next matching gate will ask again. |
+| `tool_type_session` | Approves every call to the same tool type (e.g. `Bash`) for the rest of this task. |
+| `tool_type:<name>` | Same as `tool_type_session`, but pinned to a specific tool (`tool_type:Bash`). |
+| `tool_group_session` / `tool_group:<name>` | Same pattern by tool group (`Edit` + `Write` are grouped as file-write, etc.). |
+| `bash_pattern:<glob>` | Approves Bash commands matching a glob (e.g. `bash_pattern:pytest*`). |
+| `write_path:<glob>` | Approves Write/Edit calls whose target path matches the glob (e.g. `write_path:tests/**`). |
+| `rule:<rule_id>` | Approves every future gate fired by a specific rule. |
+| `all_session` | Nuclear option — approves every subsequent gate in the task. Requires `--yes`. |
+
+Approvals only affect the current task; they do not persist across tasks.
+
+### Denying a gate
+
+```bash
+node lib/bin/bgagent.js deny <TASK_ID> <REQUEST_ID>
+node lib/bin/bgagent.js deny <TASK_ID> <REQUEST_ID> --reason "run the migration dry-run first"
+node lib/bin/bgagent.js deny <TASK_ID> <REQUEST_ID> --reason-file deny.txt
+```
+
+The optional `--reason` text is sanitized and truncated server-side, then best-effort injected into the agent's Stop-hook context so it can adapt (try a different approach, ask you a question, or stop gracefully) instead of retrying blindly. Use `--reason-file` when the reason is multi-line and would otherwise require careful shell quoting.
+
+### Discovering repo policies
+
+Before submitting a task you can list the rules that apply to the target repository:
+
+```bash
+node lib/bin/bgagent.js policies list --repo owner/repo
+node lib/bin/bgagent.js policies list --repo owner/repo --tier soft
+node lib/bin/bgagent.js policies show --repo owner/repo --rule force_push_any
+```
+
+`policies list` prints both tiers: **hard-deny** rules are absolute (even `--pre-approve` cannot bypass them), **soft-deny** rules are the approvable ones. `policies show` prints the full detail for a specific rule (severity, timeout, category, summary).
+
+### Pre-approving scopes at submit time
+
+If you trust a task to make a certain class of changes without interactive confirmation, pre-approve them up front:
+
+```bash
+node lib/bin/bgagent.js submit --repo owner/repo --issue 42 \
+  --pre-approve tool_type:Bash \
+  --pre-approve write_path:tests/**
+
+# Per-task timeout override (platform default is 300s)
+node lib/bin/bgagent.js submit --repo owner/repo --issue 42 --approval-timeout 600
+```
+
+`--pre-approve` can be repeated up to the platform limit (see `bgagent submit --help` for the current cap). Valid scope forms are the same as the `approve --scope` table above. Hard-deny rules are still enforced — `--pre-approve` only short-circuits soft-deny rules.
+
+`--approval-timeout` sets the task-wide default; a rule with its own `@approval_timeout_s` annotation still takes the minimum of the two.
+
 ## Webhook integration
 
 Webhooks allow external systems (CI pipelines, GitHub Actions, custom automation) to create tasks without Cognito credentials. Each webhook integration has its own HMAC-SHA256 shared secret.
@@ -632,7 +895,7 @@ curl -X POST "$API_URL/webhooks/tasks" \
   -d "$BODY"
 ```
 
-The request body is identical to `POST /v1/tasks` (same `repo`, `issue_number`, `task_description`, `task_type`, `pr_number`, `max_turns`, `max_budget_usd` fields). The `Idempotency-Key` header is also supported. You can submit `pr_iteration` tasks via webhook to automate PR feedback loops, or `pr_review` tasks to trigger automated code reviews.
+The request body is identical to `POST /v1/tasks` (same `repo`, `issue_number`, `task_description`, `workflow_ref`, `pr_number`, `max_turns`, `max_budget_usd` fields). The `Idempotency-Key` header is also supported. You can submit `coding/pr-iteration-v1` tasks via webhook to automate PR feedback loops, or `coding/pr-review-v1` tasks to trigger automated code reviews.
 
 **Example response** (same shape as a successful `POST /tasks`  - `status` is `SUBMITTED`; session, PR, and cost fields are `null` until the run progresses):
 
@@ -667,10 +930,12 @@ When you create a task, the platform orchestrates it through these states:
 flowchart LR
     S[SUBMITTED] --> H[HYDRATING]
     H --> R[RUNNING]
+    R <--> A[AWAITING_APPROVAL]
     R --> C[COMPLETED]
     R --> F[FAILED]
     R --> X[CANCELLED]
     R --> T[TIMED_OUT]
+    A --> X
     H --> F
     H --> X
     S --> F
@@ -681,15 +946,18 @@ The orchestrator uses Lambda Durable Functions to manage the lifecycle durably -
 
 | Status | Meaning |
 |---|---|
+| `PENDING_UPLOADS` | Initial state while presigned attachment uploads are pending confirmation |
 | `SUBMITTED` | Task accepted; orchestrator invoked asynchronously |
 | `HYDRATING` | Orchestrator passed admission control; assembling the agent payload |
 | `RUNNING` | Agent session started and actively working on the task |
+| `AWAITING_APPROVAL` | Agent paused at a Cedar HITL gate; waiting for your `approve` or `deny` decision. See [Approval gates](#approval-gates-cedar-hitl). |
+| `FINALIZING` | Agent session ended; task is wrapping up (post-session hooks / PR finalization) before reaching a terminal state |
 | `COMPLETED` | Agent finished and created a PR (or determined no changes were needed) |
 | `FAILED` | Something went wrong - pre-flight check failed, concurrency limit reached, guardrail blocked the content, or the agent encountered an error |
 | `CANCELLED` | Task was cancelled by the user |
-| `TIMED_OUT` | Task exceeded the maximum allowed duration (~9 hours) |
+| `TIMED_OUT` | Task exceeded the maximum allowed duration (~8 hours, the AgentCore max session duration; the orchestrator safety-net timer is slightly longer) |
 
-Terminal states: `COMPLETED`, `FAILED`, `CANCELLED`, `TIMED_OUT`.
+Terminal states: `COMPLETED`, `FAILED`, `CANCELLED`, `TIMED_OUT`. `AWAITING_APPROVAL` is not terminal — a decision (or an approval-timeout) always flips it back to `RUNNING` or onto a terminal state.
 
 Task records in terminal states are automatically deleted after 90 days (configurable via `taskRetentionDays`).
 
@@ -713,6 +981,7 @@ Available events:
 - **Orchestration** - `admission_rejected`, `hydration_started`, `hydration_complete`
 - **Checks** - `preflight_failed`, `guardrail_blocked`
 - **Interactive** - `nudge_acknowledged`, `agent_milestone`
+- **Approvals (Cedar HITL)** - `approval_requested`, `approval_recorded`, `approval_timed_out`
 - **Output** - `pr_created`, `pr_updated`
 
 **Error classifiers** on terminal failure events provide a specific reason:
@@ -731,7 +1000,7 @@ If a task fails with a `preflight_failed` event, the platform rejected the run b
 
 - `GITHUB_UNREACHABLE` - The platform could not reach the GitHub API. Check network connectivity and GitHub status.
 - `REPO_NOT_FOUND_OR_NO_ACCESS` - The GitHub PAT does not have access to the target repository, or the repo does not exist.
-- `INSUFFICIENT_GITHUB_REPO_PERMISSIONS` - The PAT lacks the required permissions for the task type. For `new_task` and `pr_iteration`, you need Contents (read/write) and Pull requests (read/write). For `pr_review`, Triage or higher is enough.
+- `INSUFFICIENT_GITHUB_REPO_PERMISSIONS` - The PAT lacks the required permissions for the workflow. For `coding/new-task-v1` and `coding/pr-iteration-v1`, you need Contents (read/write) and Pull requests (read/write). For `coding/pr-review-v1`, Triage or higher is enough.
 - `PR_NOT_FOUND_OR_CLOSED` - The specified PR does not exist or is already closed.
 
 To fix permission issues, update the GitHub PAT in AWS Secrets Manager and submit a new task. See [Developer guide - Repository preparation](./DEVELOPER_GUIDE.md#repository-preparation) for the full permissions table.
@@ -750,11 +1019,19 @@ Filter by task ID to find logs for a specific task.
 
 ### Notifications (GitHub edit-in-place)
 
-When a task targets a pull request (`pr_iteration` or `pr_review`), the platform automatically posts a status comment on the PR and edits it in place as the task progresses. This gives collaborators visibility into the agent's work without polling the CLI or API.
+When a task targets a pull request (`coding/pr-iteration-v1` or `coding/pr-review-v1`), the platform automatically posts a status comment on the PR and edits it in place as the task progresses. This gives collaborators visibility into the agent's work without polling the CLI or API.
 
 The notification plane uses DynamoDB Streams to fan out task events to channel-specific dispatchers. Currently the GitHub edit-in-place dispatcher is active; Slack and Email dispatchers are planned.
 
 The status comment shows: current phase, last milestone, cost so far, and a link to the task. It updates on key events (`session_started`, `pr_created`, `task_completed`, `task_failed`, `nudge_acknowledged`, and routable agent milestones).
+
+### Preview-deploy screenshots (optional)
+
+If your repo is wired to a deploy provider that publishes GitHub `deployment_status` events (Vercel, Amplify Hosting, Netlify, GitHub Actions custom CD, etc.), ABCA can capture a full-page screenshot of each preview URL and post it as an image comment on the open PR — and on the linked Linear issue if Linear is configured.
+
+This runs independently of the agent: there's no LLM involved, just a Lambda that drives a headless browser via AgentCore Browser. End-to-end latency is typically 10–15 seconds after the deploy provider reports success.
+
+Setup is opt-in and per-repo. See the [Deploy preview screenshots guide](./DEPLOY_PREVIEW_SCREENSHOTS_GUIDE.md) for the wiring (one webhook on the repo, one secret pasted into AWS).
 
 ## What the agent does
 

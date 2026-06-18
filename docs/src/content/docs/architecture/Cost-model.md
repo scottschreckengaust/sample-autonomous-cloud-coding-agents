@@ -17,7 +17,7 @@ These costs are incurred regardless of task volume:
 | NAT Gateway (1×) | ~$32/month | Fixed hourly cost + data processing. Single AZ (see [COMPUTE.md  - Network architecture](/architecture/compute)). |
 | VPC Interface Endpoints (7×, 2 AZs) | ~$102/month | $0.01/hr × 7 endpoints × 2 AZs × 730 hrs. |
 | VPC Flow Logs | ~$3/month | CloudWatch ingestion. |
-| DynamoDB (on-demand, idle) | ~$0/month | Pay-per-request; 6 tables (Tasks, Events, Nudges, UserConcurrency, Webhooks, Repo). No cost when idle. |
+| DynamoDB (on-demand, idle) | ~$0/month | Pay-per-request; 7 core tables (Tasks, Events, Nudges, Approvals, UserConcurrency, Webhooks, Repo). Integration tables add more when enabled (Slack: installation, user-mapping; Linear: project-mapping, user-mapping, workspace-registry, webhook-dedup). No cost when idle. |
 | S3 Trace Artifacts bucket (idle) | ~$0/month | 7-day lifecycle auto-expires objects; no cost when no traces are stored. |
 | EventBridge reconciler rule | <$0.01/month | Invokes Lambda every 5 min (288/day). Rule itself is free; Lambda invocation is the cost (see below). |
 | Stranded task reconciler Lambda (idle) | <$0.01/month | 288 invocations/day × 256 MB × ~100 ms avg (early exit when no stranded tasks). ~$0.005/month total (requests + duration). |
@@ -27,7 +27,7 @@ These costs are incurred regardless of task volume:
 
 ### Scale-to-zero characteristics
 
-Most platform components are fully serverless and incur zero cost when idle: DynamoDB (PAY_PER_REQUEST, 6 tables), Lambda, API Gateway, S3 (trace artifacts auto-expire in 7 days), SQS (fanout DLQ), ECS Fargate (cluster is free, when enabled), AgentCore Runtime (per-session), Bedrock (per-token), and Cognito (free tier). The stranded task reconciler adds <$0.01/month even when idle (288 Lambda invocations/day, early-exit). The always-on cost floor (~$140–150/month) is dominated by VPC networking infrastructure (NAT Gateway + 7 interface endpoints across 2 AZs) which is required for private subnet connectivity to AWS services and GitHub. See the [Deployment guide](/getting-started/deployment-guide) for the full scale-to-zero breakdown.
+Most platform components are fully serverless and incur zero cost when idle: DynamoDB (PAY_PER_REQUEST, 7 core tables plus integration tables when Slack/Linear are enabled), Lambda, API Gateway, S3 (trace artifacts auto-expire in 7 days), SQS (fanout DLQ), ECS Fargate (cluster is free, when enabled), AgentCore Runtime (per-session), Bedrock (per-token), and Cognito (free tier). The stranded task reconciler adds <$0.01/month even when idle (288 Lambda invocations/day, early-exit). The always-on cost floor (~$140–150/month) is dominated by VPC networking infrastructure (NAT Gateway + 7 interface endpoints across 2 AZs) which is required for private subnet connectivity to AWS services and GitHub. See the [Deployment guide](/getting-started/deployment-guide) for the full scale-to-zero breakdown.
 
 ## Per-task variable costs
 
@@ -50,6 +50,22 @@ Assuming a typical task: 1–2 hours, Claude Sonnet, ~100K input tokens, ~20K ou
 | NAT Gateway data | <$0.01 | GitHub API traffic: clone + push. Small repos: <10 MB. |
 | Custom step Lambdas | $0–0.05 | Only if configured. Per-invocation: ~$0.01 per step. |
 | **Total per task** | **$2–15** | Bedrock tokens dominate (>90% of per-task cost). New interactive features add <$0.01 per task. |
+
+### Optional: deploy-preview screenshots
+
+The screenshot pipeline (see [Deploy preview screenshots guide](/using/deploy-preview-screenshots-guide)) is opt-in per repo and deterministic — no LLM, no agent runtime. Only fires when a connected deploy provider posts `deployment_status: success`.
+
+| Component | Estimated cost per screenshot | Notes |
+|---|---|---|
+| AgentCore Browser session | $0.005–0.015 | ~30–60 s of `aws.browser.v1` for navigate + capture. Per-second billing. |
+| Lambda processor | <$0.001 | 512 MB, ~10–20 s wall time per invocation. |
+| S3 PutObject + storage | <$0.001 | One PNG (~200 KB–2 MB), 30-day TTL via lifecycle. |
+| CloudFront request + bytes-out | <$0.001 | First-render fetch from GitHub markdown image proxy + a small number of viewer fetches. |
+| **Total per screenshot** | **~$0.01** | Dominated by AgentCore Browser session time. |
+
+Baseline overhead (CloudFront distribution + S3 bucket idle) is <$1/month and absorbed into the existing infrastructure baseline above. CloudFront has no per-distribution monthly fee; you pay only per-request and per-byte-out.
+
+A high-volume team with ~500 preview deploys per month would add ~$5/month to the per-task variable line, which is rounding error compared to Bedrock token costs.
 
 ### Cost sensitivity analysis
 

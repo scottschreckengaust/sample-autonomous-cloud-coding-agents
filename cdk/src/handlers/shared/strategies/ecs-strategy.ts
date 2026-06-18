@@ -41,6 +41,9 @@ export class EcsComputeStrategy implements ComputeStrategy {
 
   async startSession(input: {
     taskId: string;
+    /** Accepted to satisfy the ComputeStrategy interface; ECS doesn't
+     *  use a workload-token-injecting runtime so this is unused. */
+    userId: string;
     payload: Record<string, unknown>;
     blueprintConfig: BlueprintConfig;
   }): Promise<SessionHandle> {
@@ -104,7 +107,7 @@ export class EcsComputeStrategy implements ComputeStrategy {
       + 'system_prompt_overrides=p.get("system_prompt_overrides",""), '
       + 'prompt_version=p.get("prompt_version",""), '
       + 'memory_id=p.get("memory_id",""), '
-      + 'task_type=p.get("task_type","new_task"), '
+      + 'resolved_workflow=p.get("resolved_workflow"), '
       + 'branch_name=p.get("branch_name",""), '
       + 'pr_number=str(p.get("pr_number",""))'
       + '); '

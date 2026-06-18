@@ -21,10 +21,37 @@ import { classifyError, type ErrorClassification } from './error-classifier';
 import { logger } from './logger';
 import { coerceNumericOrNull } from './numeric';
 import type { ComputeType } from './repo-config';
+// Cross-language constants — see ``contracts/constants.md``. Imported at
+// TypeScript compile time (resolveJsonModule); esbuild inlines the values
+// into the bundled Lambda artifact, so no runtime FS read is needed.
+import sharedConstants from '../../../../contracts/constants.json';
 import type { TaskStatusType } from '../../constructs/task-status';
 
-/** Valid task types for task creation. */
-export type TaskType = 'new_task' | 'pr_iteration' | 'pr_review';
+/**
+ * Re-export of {@link TaskStatusType} so the CDK↔CLI type-sync drift
+ * check sees a single declaration site for the API status union. The
+ * canonical source remains ``cdk/src/constructs/task-status.ts``.
+ */
+export type { TaskStatusType };
+
+/**
+ * A resolved workflow pin: the ``{id, version}`` produced at the create-task
+ * boundary from a ``workflow_ref`` (or the resolution fallback). Replaces the
+ * former ``task_type`` enum end-to-end (#248). Persisted on the TaskRecord and
+ * threaded to the agent so it loads the exact pinned workflow file.
+ *
+ * Keep in sync with ``cli/src/types.ts::ResolvedWorkflow``.
+ */
+export type ResolvedWorkflow = {
+  readonly id: string;
+  readonly version: string;
+};
+
+/** Shared across all attachment interfaces. Add new types here (e.g., 'audio'). */
+export type AttachmentType = 'image' | 'file' | 'url';
+
+/** Delivery mechanism — discriminant for the three upload paths. */
+export type AttachmentDelivery = 'inline' | 'presigned' | 'url_fetch';
 
 /**
  * Provenance of a task's submission. Shared across inbound adapters:
@@ -32,18 +59,14 @@ export type TaskType = 'new_task' | 'pr_iteration' | 'pr_review';
  * - ``webhook``: HMAC-signed inbound webhook submissions (generic webhook endpoint)
  * - ``slack``: Slack @mention / slash-command submissions (see SlackIntegration)
  * - ``linear``: Linear label-triggered submissions (see LinearIntegration)
+ * - ``jira``: Jira Cloud label-triggered submissions (see JiraIntegration)
  *
  * Narrowed from ``string`` so switches and predicates that read
  * ``channel_source`` get exhaustiveness checking at compile time; matches the
  * internal ``CreateTaskContext.channelSource`` literal in ``create-task-core.ts``.
  * Keep in sync with ``cli/src/types.ts::ChannelSource``.
  */
-export type ChannelSource = 'api' | 'webhook' | 'slack' | 'linear';
-
-/** Task types that operate on an existing pull request. */
-export function isPrTaskType(taskType: TaskType): boolean {
-  return taskType === 'pr_iteration' || taskType === 'pr_review';
-}
+export type ChannelSource = 'api' | 'webhook' | 'slack' | 'linear' | 'jira';
 
 /**
  * Full task record as stored in DynamoDB.
@@ -52,9 +75,16 @@ export interface TaskRecord {
   readonly task_id: string;
   readonly user_id: string;
   readonly status: TaskStatusType;
-  readonly repo: string;
+  /** Target repository (``owner/repo``). Optional since #248 Phase 3: a
+   *  repo-less workflow (``requires_repo: false``) runs with no repo. */
+  readonly repo?: string;
   readonly issue_number?: number;
-  readonly task_type: TaskType;
+  /** The ref the caller supplied (if any); resolution may fall back to a
+   *  default when absent. Persisted for audit alongside ``resolved_workflow``. */
+  readonly workflow_ref?: string;
+  /** The pinned ``{id, version}`` this task runs. Resolved at the create-task
+   *  boundary; optional only on records that predate the cutover. */
+  readonly resolved_workflow?: ResolvedWorkflow;
   readonly pr_number?: number;
   readonly task_description?: string;
   readonly branch_name: string;
@@ -96,6 +126,9 @@ export interface TaskRecord {
    * ``get-trace-url`` handler reads this to issue presigned download URLs.
    */
   readonly trace_s3_uri?: string;
+  /** S3 URI of a repo-less workflow's delivered artifact (deliver_artifact,
+   *  #248 Phase 3); absent for coding tasks / comment-only delivery. */
+  readonly artifact_uri?: string;
   /** Rev-5 DATA-1: authoritative SDK counter including the attempt that
    *  tripped any cap. Equals the legacy `turns` value. */
   readonly turns_attempted?: number;
@@ -124,6 +157,55 @@ export interface TaskRecord {
    * dispatch fires successfully.
    */
   readonly github_comment_id?: number;
+  /**
+   * Event ID of the terminal event whose Linear final-status comment
+   * was successfully posted (fan-out plane). Linear has no comment
+   * edit API, so the dispatcher is post-once: this marker makes the
+   * post idempotent across partial-batch Lambda retries (a sibling
+   * channel's infra rejection re-runs every dispatcher for the
+   * record). Absent until the first successful post.
+   */
+  readonly linear_final_comment_event_id?: string;
+  readonly attachments?: AttachmentRecord[];
+  /**
+   * Cedar HITL: per-task default approval timeout (design §10.2).
+   * Default 300s when absent. The engine clamps to
+   * ``[APPROVAL_TIMEOUT_S_MIN, APPROVAL_TIMEOUT_S_MAX]`` at task
+   * start; min-wins against per-rule ``@approval_timeout_s`` at
+   * gate-firing time.
+   */
+  readonly approval_timeout_s?: number;
+  /**
+   * Cedar HITL: pre-approval allowlist scopes from submit time
+   * (design §10.2, §7.3 step 4). The engine seeds
+   * ``ApprovalAllowlist`` from this list at container start so
+   * gates matching any scope here never fire.
+   */
+  readonly initial_approvals?: readonly string[];
+  /**
+   * Cedar HITL: running counter of approval gates fired on this
+   * task (design §10.2, §13.6). Enforced against
+   * ``approvalGateCap`` (decision #13); survives container restart
+   * so cumulative damage is bounded across restarts.
+   */
+  readonly approval_gate_count?: number;
+  /**
+   * Cedar HITL: per-task cap on total approval gates (design §4 step 5,
+   * §13.6, decision #13). Resolved at submit-time from
+   * ``Blueprint.security.approvalGateCap ?? 50`` and persisted here so
+   * the cap is captured at submit and NOT re-read from the blueprint
+   * during a container restart (mid-task blueprint edits must not
+   * shift the cap beneath a running task). Bounded to ``[1, 500]``
+   * by create-task validation to match the agent-side
+   * ``APPROVAL_GATE_CAP_MIN / MAX`` constants in ``agent/src/policy.py``.
+   */
+  readonly approval_gate_cap?: number;
+  /**
+   * Cedar HITL: when ``status = AWAITING_APPROVAL``, the
+   * ``request_id`` of the pending approval row. Cleared
+   * atomically on resume (§10.2, §9).
+   */
+  readonly awaiting_approval_request_id?: string;
 }
 
 /** Per-channel override for one notification channel. See
@@ -147,6 +229,7 @@ export interface TaskNotificationsConfig {
   readonly slack?: ChannelConfig;
   readonly email?: ChannelConfig;
   readonly github?: ChannelConfig;
+  readonly linear?: ChannelConfig;
 }
 
 /**
@@ -156,9 +239,10 @@ export interface TaskNotificationsConfig {
 export interface TaskDetail {
   readonly task_id: string;
   readonly status: TaskStatusType;
-  readonly repo: string;
+  /** ``null`` for a repo-less workflow (#248 Phase 3). */
+  readonly repo: string | null;
   readonly issue_number: number | null;
-  readonly task_type: TaskType;
+  readonly resolved_workflow: ResolvedWorkflow | null;
   readonly pr_number: number | null;
   readonly task_description: string | null;
   readonly branch_name: string;
@@ -198,6 +282,24 @@ export interface TaskDetail {
    *  the field being present; CLI download resolves this via the
    *  ``get-trace-url`` handler rather than hitting S3 directly. */
   readonly trace_s3_uri: string | null;
+  /** S3 URI of a repo-less delivered artifact (#248 Phase 3); ``null`` for
+   *  coding tasks or comment-only delivery. */
+  readonly artifact_uri: string | null;
+  readonly attachments: AttachmentSummary[] | null;
+  /** Cedar HITL: running counter of approval gates fired on this
+   *  task (TaskRecord §10.2, §13.6). Surfaced so CLI / dashboard
+   *  consumers can report how many gates a task used without re-
+   *  reading the internal TaskRecord. Null when the task predates
+   *  the counter or the agent never wrote one. */
+  readonly approval_gate_count: number | null;
+  /** Cedar HITL: per-task cap on total approval gates (TaskRecord
+   *  §4 step 5, §13.6). Captured at submit time from
+   *  ``Blueprint.security.approvalGateCap ?? 50``. Null only on
+   *  pre-Chunk-7b records. */
+  readonly approval_gate_cap: number | null;
+  /** Cedar HITL: when ``status = AWAITING_APPROVAL``, the
+   *  ``request_id`` of the pending approval row. Null otherwise. */
+  readonly awaiting_approval_request_id: string | null;
 }
 
 /**
@@ -206,9 +308,10 @@ export interface TaskDetail {
 export interface TaskSummary {
   readonly task_id: string;
   readonly status: TaskStatusType;
-  readonly repo: string;
+  /** ``null`` for a repo-less workflow (#248 Phase 3). */
+  readonly repo: string | null;
   readonly issue_number: number | null;
-  readonly task_type: TaskType;
+  readonly resolved_workflow: ResolvedWorkflow | null;
   readonly pr_number: number | null;
   readonly task_description: string | null;
   readonly branch_name: string;
@@ -265,27 +368,211 @@ export interface GetTaskEventsQuery {
  * Keep in sync with ``cli/src/types.ts``.
  */
 export interface CreateTaskRequest {
-  readonly repo: string;
+  /** Target repository (``owner/repo``). Optional since #248 Phase 3: a
+   *  repo-less workflow (``requires_repo: false``) is submitted without it.
+   *  Required-ness is enforced conditionally in ``createTaskCore`` based on
+   *  the resolved workflow's ``requiresRepo``. */
+  readonly repo?: string;
   readonly issue_number?: number;
   readonly task_description?: string;
   readonly max_turns?: number;
   readonly max_budget_usd?: number;
-  readonly task_type?: TaskType;
+  /** Workflow selector ``<id>[@<constraint>]``. Replaces ``task_type`` (#248).
+   *  Omitted ⇒ the create-task boundary resolves via the fallback ladder. */
+  readonly workflow_ref?: string;
   readonly pr_number?: number;
-  readonly attachments?: Attachment[];
+  readonly attachments?: readonly Attachment[];
   /** Enable 4 KB debug previews (design §10.1, opt-in per task). */
   readonly trace?: boolean;
+  /** Cedar HITL: per-task approval timeout (§7.3). Bounded by
+   *  ``[APPROVAL_TIMEOUT_S_MIN, APPROVAL_TIMEOUT_S_MAX]``. */
+  readonly approval_timeout_s?: number;
+  /** Cedar HITL: pre-approved scopes that skip the gate (§7.3 step 4).
+   *  Typed as ``ApprovalScope[]`` (the strict union accepted by the
+   *  agent's ``parse_approval_scope``); CDK validates the parse result
+   *  before forwarding. */
+  readonly initial_approvals?: readonly ApprovalScope[];
 }
 
 /**
- * Attachment in create task request.
+ * Wire format — parsed from untrusted JSON. Validate before use.
  */
 export interface Attachment {
-  readonly type: 'image' | 'file' | 'url';
+  readonly type: AttachmentType;
   readonly content_type?: string;
   readonly data?: string;
   readonly url?: string;
   readonly filename?: string;
+  readonly expected_size_bytes?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Validated attachment types (post-validation discriminated union)
+// ---------------------------------------------------------------------------
+
+interface BaseValidatedAttachment {
+  readonly filename: string;
+  readonly content_type: string;
+}
+
+/** Inline image/file: data present, validated, decoded, magic-bytes checked. */
+export interface InlineAttachment extends BaseValidatedAttachment {
+  readonly delivery: 'inline';
+  readonly type: 'image' | 'file';
+  readonly data: string;
+  readonly url?: never;
+  readonly decoded_size_bytes: number;
+}
+
+/** Presigned upload: metadata only, no data, no url. */
+export interface PresignedAttachment extends BaseValidatedAttachment {
+  readonly delivery: 'presigned';
+  readonly type: 'image' | 'file';
+  readonly data?: never;
+  readonly url?: never;
+  readonly expected_size_bytes: number;
+}
+
+/** URL to fetch during hydration. */
+export interface UrlAttachment extends BaseValidatedAttachment {
+  readonly delivery: 'url_fetch';
+  readonly type: 'url';
+  readonly url: string;
+  readonly data?: never;
+}
+
+/** Output of validateAttachments() — illegal combinations are unrepresentable. */
+export type ValidatedAttachment = InlineAttachment | PresignedAttachment | UrlAttachment;
+
+// ---------------------------------------------------------------------------
+// Screening result (persisted in DynamoDB as part of AttachmentRecord)
+// ---------------------------------------------------------------------------
+
+/** Screening outcome — discriminated union prevents invalid combinations. */
+export type ScreeningResult =
+  | { readonly status: 'pending' }
+  | { readonly status: 'passed'; readonly screened_at: string }
+  | { readonly status: 'blocked'; readonly screened_at: string; readonly categories: [string, ...string[]] };
+
+// ---------------------------------------------------------------------------
+// Attachment record (persisted metadata in TaskRecord) — discriminated union
+// keyed on screening.status ensures that passed records always have storage fields.
+// ---------------------------------------------------------------------------
+
+interface BaseAttachmentRecord {
+  readonly attachment_id: string;
+  readonly type: AttachmentType;
+  readonly content_type: string;
+  readonly filename: string;
+  readonly source_url?: string;
+  readonly token_estimate?: number;
+}
+
+export interface PendingAttachmentRecord extends BaseAttachmentRecord {
+  readonly screening: { readonly status: 'pending' };
+  readonly s3_key?: string;
+  readonly s3_version_id?: string;
+  readonly size_bytes?: number;
+  readonly checksum_sha256?: string;
+}
+
+export interface PassedAttachmentRecord extends BaseAttachmentRecord {
+  readonly screening: { readonly status: 'passed'; readonly screened_at: string };
+  readonly s3_key: string;
+  readonly s3_version_id: string;
+  readonly size_bytes: number;
+  readonly checksum_sha256: string;
+}
+
+export interface BlockedAttachmentRecord extends BaseAttachmentRecord {
+  readonly screening: { readonly status: 'blocked'; readonly screened_at: string; readonly categories: [string, ...string[]] };
+  readonly s3_key?: string;
+  readonly s3_version_id?: string;
+  readonly size_bytes?: number;
+  readonly checksum_sha256?: string;
+}
+
+export type AttachmentRecord = PendingAttachmentRecord | PassedAttachmentRecord | BlockedAttachmentRecord;
+
+/** Parameters for creating an AttachmentRecord — accepts the union of all fields. */
+export type CreateAttachmentRecordParams = {
+  readonly attachment_id: string;
+  readonly type: AttachmentType;
+  readonly content_type: string;
+  readonly filename: string;
+  readonly s3_key?: string;
+  readonly s3_version_id?: string;
+  readonly size_bytes?: number;
+  readonly screening: ScreeningResult;
+  readonly source_url?: string;
+  readonly checksum_sha256?: string;
+  readonly token_estimate?: number;
+};
+
+/**
+ * Factory function enforcing cross-field invariants on AttachmentRecord construction.
+ * Returns the appropriate discriminated union variant based on screening status.
+ */
+export function createAttachmentRecord(params: CreateAttachmentRecordParams): AttachmentRecord {
+  if (params.screening.status === 'passed') {
+    if (!params.s3_key || !params.s3_version_id || !params.checksum_sha256 || !params.size_bytes) {
+      throw new Error('Passed screening requires s3_key, s3_version_id, checksum_sha256, and size_bytes');
+    }
+    return params as PassedAttachmentRecord;
+  }
+  if (params.screening.status === 'blocked') {
+    return params as BlockedAttachmentRecord;
+  }
+  return params as PendingAttachmentRecord;
+}
+
+// ---------------------------------------------------------------------------
+// Attachment summary (API response — metadata only, no binary content)
+// ---------------------------------------------------------------------------
+
+export interface AttachmentSummary {
+  readonly attachment_id: string;
+  readonly type: AttachmentType;
+  readonly filename: string;
+  readonly content_type: string;
+  readonly size_bytes: number;
+  readonly screening_status: 'passed' | 'blocked' | 'pending';
+}
+
+// ---------------------------------------------------------------------------
+// Presigned upload response (returned on PENDING_UPLOADS creation)
+// ---------------------------------------------------------------------------
+
+export interface AttachmentUploadInstruction {
+  readonly attachment_id: string;
+  readonly filename: string;
+  readonly upload_url: string;
+  readonly upload_fields: Record<string, string>;
+  readonly upload_expires_at: string;
+}
+
+/** Response from POST /v1/tasks when presigned uploads are required. */
+export interface CreateTaskResponse extends TaskDetail {
+  readonly upload_instructions?: readonly AttachmentUploadInstruction[];
+  readonly task_expires_at?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Agent attachment payload (orchestrator → agent runtime)
+// ---------------------------------------------------------------------------
+
+/** Attachment descriptor sent to the agent runtime. Exported for test assertions. */
+export interface AgentAttachmentPayload {
+  readonly attachment_id: string;
+  readonly type: AttachmentType;
+  readonly content_type: string;
+  readonly filename: string;
+  readonly s3_uri: string;
+  readonly s3_version_id: string;
+  readonly size_bytes: number;
+  readonly source_url?: string;
+  readonly token_estimate?: number;
+  readonly checksum_sha256: string;
 }
 
 /**
@@ -308,9 +595,9 @@ export function toTaskDetail(record: TaskRecord): TaskDetail {
   return {
     task_id: record.task_id,
     status: record.status,
-    repo: record.repo,
+    repo: record.repo ?? null,
     issue_number: record.issue_number ?? null,
-    task_type: record.task_type ?? 'new_task',
+    resolved_workflow: record.resolved_workflow ?? null,
     pr_number: record.pr_number ?? null,
     task_description: record.task_description ?? null,
     branch_name: record.branch_name,
@@ -333,6 +620,28 @@ export function toTaskDetail(record: TaskRecord): TaskDetail {
     prompt_version: record.prompt_version ?? null,
     trace: record.trace === true,
     trace_s3_uri: record.trace_s3_uri ?? null,
+    artifact_uri: record.artifact_uri ?? null,
+    attachments: record.attachments
+      ? record.attachments.map(a => ({
+        attachment_id: a.attachment_id,
+        type: a.type,
+        filename: a.filename,
+        content_type: a.content_type,
+        size_bytes: a.size_bytes ?? 0, // 0 for pending attachments (size unknown until resolved)
+        screening_status: a.screening.status,
+      }))
+      : null,
+    approval_gate_count: coerceNumericOrNull(
+      record.approval_gate_count,
+      { ...ctx, field: 'approval_gate_count' },
+      logger,
+    ),
+    approval_gate_cap: coerceNumericOrNull(
+      record.approval_gate_cap,
+      { ...ctx, field: 'approval_gate_cap' },
+      logger,
+    ),
+    awaiting_approval_request_id: record.awaiting_approval_request_id ?? null,
   };
 }
 
@@ -464,9 +773,9 @@ export function toTaskSummary(record: TaskRecord): TaskSummary {
   return {
     task_id: record.task_id,
     status: record.status,
-    repo: record.repo,
+    repo: record.repo ?? null,
     issue_number: record.issue_number ?? null,
-    task_type: record.task_type ?? 'new_task',
+    resolved_workflow: record.resolved_workflow ?? null,
     pr_number: record.pr_number ?? null,
     task_description: record.task_description ?? null,
     branch_name: record.branch_name,
@@ -475,3 +784,317 @@ export function toTaskSummary(record: TaskRecord): TaskSummary {
     updated_at: record.updated_at,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Cedar HITL approval types (design §7, §10.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Scope of an approval grant. Narrowed from `string` so the approve
+ * handler + CLI can exhaustiveness-check the union on parse.
+ *
+ * - `this_call`          — one-shot. Does NOT grow the allowlist.
+ * - `tool_type_session`  — allow any further invocation of the same tool name
+ *                          for the rest of the session.
+ * - `tool_group_session` — allow any tool in the matching tool group
+ *                          (currently `file_write` → Write/Edit).
+ * - `bash_pattern:...`   — allow Bash commands matching the pattern (fnmatch).
+ * - `write_path:...`     — allow Write/Edit against paths matching the pattern.
+ * - `rule:<rule_id>`     — allow soft-deny hits whose rule_id matches.
+ * - `all_session`        — allow anything for the rest of the session. Gated
+ *                          by blueprint `maxPreApprovalScope` (§7.5).
+ *
+ * Keep in sync with ``cli/src/types.ts``.
+ */
+export type ApprovalScope =
+  | 'this_call'
+  | 'tool_type_session'
+  | 'tool_group_session'
+  | 'all_session'
+  | `tool_type:${string}`
+  | `tool_group:${string}`
+  | `bash_pattern:${string}`
+  | `write_path:${string}`
+  | `rule:${string}`;
+
+/**
+ * Approval row status values. PENDING is the only non-terminal state —
+ * every other transition is final, which matches the
+ * `ConditionExpression: status = :pending` guard on every mutator.
+ */
+export type ApprovalStatus =
+  | 'PENDING'
+  | 'APPROVED'
+  | 'DENIED'
+  | 'TIMED_OUT'
+  | 'STRANDED';
+
+/**
+ * Cedar HITL severity, surfaced in the CLI approval prompt and used
+ * for severity-gated channel routing (§11.2: high-severity rules
+ * skip Slack-button auto-approval). Shared alias so the same literal
+ * union is not redefined inline in `ApprovalRecord`,
+ * `PendingApprovalSummary`, `PolicyRuleSummary`, etc.
+ */
+export type Severity = 'low' | 'medium' | 'high';
+
+/**
+ * Fields shared by every approval row regardless of status. Internal
+ * type — callers should consume the discriminated {@link ApprovalRecord}
+ * so `status` narrows the optional fields below.
+ *
+ * PK = `task_id`, SK = `request_id` (ULID minted by the agent). GSI
+ * `user_id-status-index` powers `GET /v1/pending` without a Scan.
+ *
+ * `matching_rule_ids` is a List, not a StringSet — DDB string sets
+ * cannot be empty and pathological no-match soft-deny hits would fail
+ * to persist (§10.1).
+ */
+interface ApprovalRecordBase {
+  readonly task_id: string;
+  readonly request_id: string;
+  readonly tool_name: string;
+  readonly tool_input_preview: string;
+  readonly tool_input_sha256: string;
+  readonly reason: string;
+  readonly severity: Severity;
+  readonly matching_rule_ids: readonly string[];
+  readonly created_at: string;
+  readonly timeout_s: number;
+  readonly ttl: number;
+  readonly user_id: string;
+  readonly repo: string;
+}
+
+/** PENDING approval row — no decision recorded yet. */
+export interface PendingApprovalRecord extends ApprovalRecordBase {
+  readonly status: 'PENDING';
+}
+
+/** APPROVED approval row — decided_at + scope are required. */
+export interface ApprovedApprovalRecord extends ApprovalRecordBase {
+  readonly status: 'APPROVED';
+  readonly decided_at: string;
+  readonly scope: ApprovalScope;
+}
+
+/** DENIED approval row — decided_at required, deny_reason optional. */
+export interface DeniedApprovalRecord extends ApprovalRecordBase {
+  readonly status: 'DENIED';
+  readonly decided_at: string;
+  readonly deny_reason?: string;
+}
+
+/** TIMED_OUT approval row — decided_at required (server-set). */
+export interface TimedOutApprovalRecord extends ApprovalRecordBase {
+  readonly status: 'TIMED_OUT';
+  readonly decided_at: string;
+}
+
+/** STRANDED approval row — decided_at required (set by the
+ *  stranded-task reconciler). No user decision was ever recorded. */
+export interface StrandedApprovalRecord extends ApprovalRecordBase {
+  readonly status: 'STRANDED';
+  readonly decided_at: string;
+}
+
+/**
+ * Full approval row as stored in `TaskApprovalsTable` (design §10.1).
+ *
+ * Discriminated union on ``status`` so callers can narrow on the
+ * status field and get exhaustiveness checking on the optional
+ * decision fields. Pre-S3 this was a single interface with every
+ * decision-time field optional, which let illegal combinations
+ * type-check (e.g. an APPROVED record without a `scope`).
+ */
+export type ApprovalRecord =
+  | PendingApprovalRecord
+  | ApprovedApprovalRecord
+  | DeniedApprovalRecord
+  | TimedOutApprovalRecord
+  | StrandedApprovalRecord;
+
+/**
+ * Pending approval summary returned by `GET /v1/pending` (§7.7).
+ * Derived from the GSI projection attributes only — keeps the list
+ * response cheap and avoids leaking `deny_reason` / `tool_input_sha256`
+ * on PENDING rows.
+ */
+export interface PendingApprovalSummary {
+  readonly task_id: string;
+  readonly request_id: string;
+  readonly tool_name: string;
+  readonly tool_input_preview: string;
+  readonly severity: Severity;
+  readonly reason: string;
+  readonly created_at: string;
+  readonly timeout_s: number;
+  /** Derived: `created_at + timeout_s` in ISO 8601 UTC. */
+  readonly expires_at: string;
+  /** Cedar rule ids that matched this request (design §10.1). Surfaced
+   *  so `bgagent pending` can show _why_ a gate fired without the user
+   *  spelunking TaskEventsTable. Empty array on pre-Cedar-HITL rows. */
+  readonly matching_rule_ids: readonly string[];
+}
+
+/**
+ * `POST /v1/tasks/{task_id}/approve` request body (§7.1).
+ *
+ * `scope` is optional — defaults to `this_call` when omitted.
+ *
+ * Keep in sync with ``cli/src/types.ts``.
+ */
+export interface ApprovalRequest {
+  readonly request_id: string;
+  readonly decision: 'approve';
+  readonly scope?: ApprovalScope;
+}
+
+/**
+ * `POST /v1/tasks/{task_id}/approve` response body.
+ */
+export interface ApprovalResponse {
+  readonly task_id: string;
+  readonly request_id: string;
+  readonly status: 'APPROVED';
+  readonly scope: ApprovalScope;
+  readonly decided_at: string;
+}
+
+/**
+ * `POST /v1/tasks/{task_id}/deny` request body (§7.2).
+ *
+ * `reason` is passed through `output_scanner.scanDenyReason` before
+ * persistence — user-facing secrets (AWS keys, GitHub PATs, API tokens)
+ * are redacted with `[REDACTED-...]` markers. Truncated to
+ * `DENY_REASON_MAX_LENGTH` chars AFTER scanning.
+ *
+ * Keep in sync with ``cli/src/types.ts``.
+ */
+export interface DenyRequest {
+  readonly request_id: string;
+  readonly decision: 'deny';
+  readonly reason?: string;
+}
+
+/**
+ * `POST /v1/tasks/{task_id}/deny` response body.
+ */
+export interface DenyResponse {
+  readonly task_id: string;
+  readonly request_id: string;
+  readonly status: 'DENIED';
+  readonly decided_at: string;
+}
+
+/**
+ * Maximum length of a sanitized deny reason after `output_scanner`
+ * redaction (§7.2 step 3). Matches the Phase 2 nudge limit for
+ * consistency.
+ */
+export const DENY_REASON_MAX_LENGTH = 2000;
+
+/**
+ * Rule metadata returned by `GET /v1/repos/{repo}/policies` (§7.6).
+ * `approval_timeout_s` and `severity` are absent for hard-deny rules.
+ */
+export interface PolicyRuleSummary {
+  readonly rule_id: string;
+  readonly category?: string;
+  readonly severity?: Severity;
+  readonly approval_timeout_s?: number;
+  readonly summary: string;
+}
+
+/**
+ * `GET /v1/repos/{repo_id}/policies` response body.
+ */
+export interface GetPoliciesResponse {
+  readonly repo_id: string;
+  readonly policies: {
+    readonly hard: readonly PolicyRuleSummary[];
+    readonly soft: readonly PolicyRuleSummary[];
+  };
+}
+
+/**
+ * `GET /v1/pending` response body (§7.7).
+ */
+export interface GetPendingResponse {
+  readonly pending: readonly PendingApprovalSummary[];
+}
+
+/**
+ * Lambda-written audit event type for an approve/deny decision
+ * (IMPL-6). Emitted to TaskEventsTable so the 90-day audit trail does
+ * not depend on the agent's best-effort milestone.
+ */
+export interface ApprovalDecisionRecordedEvent {
+  readonly request_id: string;
+  readonly status: 'APPROVED' | 'DENIED';
+  readonly scope?: ApprovalScope;
+  readonly reason?: string;
+  readonly decided_at: string;
+  readonly caller_user_id: string;
+}
+
+/**
+ * `CreateTaskRequest` extensions for HITL pre-approvals (§7.3).
+ *
+ * Old callers continue to work — every field is optional. New callers
+ * can pre-approve common scopes (`tool_type:Read`, `bash_pattern:git
+ * status*`) to avoid hitting gates for trusted operations, and can
+ * raise the per-task default approval timeout above the 300s default
+ * within the `[30, min(3600, maxLifetime - 300)]` bound.
+ *
+ * Keep in sync with ``cli/src/types.ts``.
+ */
+export interface CreateTaskApprovalExtensions {
+  readonly approval_timeout_s?: number;
+  readonly initial_approvals?: readonly ApprovalScope[];
+}
+
+/** Maximum `initial_approvals` entries per §7.3. */
+export const INITIAL_APPROVALS_MAX_ENTRIES = 20;
+
+/** Maximum per-entry length for an `initial_approvals` scope string. */
+export const INITIAL_APPROVALS_MAX_ENTRY_LENGTH = 128;
+
+/** Floor for `approval_timeout_s` (§6 decision #6).
+ *  Sourced from ``contracts/constants.json`` (S9). */
+export const APPROVAL_TIMEOUT_S_MIN = sharedConstants.approval_timeout_s.min;
+
+/** Absolute ceiling for `approval_timeout_s` before the
+ *  `maxLifetime - 300` clip is applied (§7.3).
+ *  Sourced from ``contracts/constants.json`` (S9). */
+export const APPROVAL_TIMEOUT_S_MAX = sharedConstants.approval_timeout_s.max;
+
+/** Default `approval_timeout_s` when the submit payload omits it.
+ *  Sourced from ``contracts/constants.json`` (S9). */
+export const APPROVAL_TIMEOUT_S_DEFAULT = sharedConstants.approval_timeout_s.default;
+
+/**
+ * Cedar HITL: bounds + platform default for the per-task approval-gate cap
+ * (design decision #13, §4 step 5). Blueprints may override via
+ * ``security.approvalGateCap``; the submit path bounds-checks the
+ * resolved value against these constants so an out-of-bounds blueprint
+ * never persists a bad cap onto a TaskRecord.
+ *
+ * Sourced from ``contracts/constants.json`` (S9 — see
+ * ``contracts/constants.md``). The same JSON is read by
+ * ``agent/src/policy.py`` at import; the drift check
+ * (``scripts/check-types-sync.ts``) verifies no other site declares
+ * these constants as literals.
+ */
+export const APPROVAL_GATE_CAP_MIN = sharedConstants.approval_gate_cap.min;
+export const APPROVAL_GATE_CAP_MAX = sharedConstants.approval_gate_cap.max;
+export const APPROVAL_GATE_CAP_DEFAULT = sharedConstants.approval_gate_cap.default;
+
+/** Minimum allowed `max_budget_usd` (1 cent). The CLI pre-validates with the
+ *  same bound (`bgagent submit --max-budget`), so it lives in
+ *  ``contracts/constants.json`` rather than as a local literal (#258). */
+export const MAX_BUDGET_USD_MIN = sharedConstants.max_budget_usd.min;
+
+/** Maximum allowed `max_budget_usd` ($100).
+ *  Sourced from ``contracts/constants.json`` (#258). */
+export const MAX_BUDGET_USD_MAX = sharedConstants.max_budget_usd.max;

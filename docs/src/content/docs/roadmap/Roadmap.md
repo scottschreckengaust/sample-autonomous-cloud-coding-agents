@@ -11,24 +11,26 @@ What's shipped and what's coming next.
 ### Core platform
 
 - [x] **Autonomous agent execution** - Isolated MicroVM (AgentCore Runtime) per task with shell, filesystem, and git access
-- [x] **CLI and REST API** - Submit, list, get, cancel, nudge, watch, trace, webhook management; view audit events; Cognito auth with token caching
+- [x] **CLI and REST API** - Submit, list, get, cancel, nudge, watch, trace, status, webhook management; Cedar HITL (`approve`, `deny`, `pending`, `policies`); Slack and Linear workspace setup; view audit events; Cognito auth with token caching
 - [x] **Durable orchestrator** - Lambda Durable Functions with checkpoint/resume; survives transient failures up to 9 hours
-- [x] **Task state machine** - SUBMITTED → HYDRATING → RUNNING → COMPLETED / FAILED / CANCELLED / TIMED_OUT
+- [x] **Task state machine** - SUBMITTED → HYDRATING → RUNNING → AWAITING_APPROVAL (Cedar HITL) → FINALIZING → COMPLETED / FAILED / CANCELLED / TIMED_OUT
 - [x] **Concurrency control** - Per-user limits (default 3) with atomic admission and automated drift reconciliation
-- [x] **Stranded task reconciler** - Scheduled Lambda detects tasks stuck in non-terminal states and drives them to failure with proper cleanup
+- [x] **Stranded task reconciler** - Scheduled Lambda detects tasks stuck in `SUBMITTED`, `HYDRATING`, or `AWAITING_APPROVAL` and drives them to failure with proper cleanup
 - [x] **Idempotency** - `Idempotency-Key` header on POST requests (24-hour TTL)
 
 ### Task types
 
-- [x] **`new_task`** - Branch, implement, build/test, open PR
-- [x] **`pr_iteration`** - Check out PR branch, read review feedback, address it, push
-- [x] **`pr_review`** - Read-only structured code review via GitHub Reviews API (no Write/Edit tools)
+- [x] **Workflow-driven tasks** - Task types are declarative, versioned **workflow** files (`agent/workflows/**`) interpreted by an agent-side step runner, not hardcoded `task_type` branches. Selected via `workflow_ref` (the `task_type` enum is removed). New task types are authored as YAML + registered step handlers, not core-code changes ([ADR-014](/architecture/adr-014-workflow-driven-tasks), [WORKFLOWS.md](/architecture/workflows))
+- [x] **`coding/new-task-v1`** - Branch, implement, build/test, open PR
+- [x] **`coding/pr-iteration-v1`** - Check out PR branch, read review feedback, address it, push
+- [x] **`coding/pr-review-v1`** - Read-only structured code review via GitHub Reviews API (no Write/Edit tools)
+- [x] **Repo-less (knowledge) workflows** - `requires_repo:false` workflows run end-to-end with no GitHub repo: `hydrate_context → run_agent → deliver_artifact`, delivering the agent's result to S3 (`artifacts/{task_id}/`) surfaced on `TaskDetail.artifact_uri`. Ships a reference `knowledge/web-research-v1` workflow; memory keys on `user:{user_id}`
 
 ### Onboarding and customization
 
-- [x] **Blueprint construct** - Per-repo CDK configuration (model, turns, budget, prompt overrides, egress, GitHub token)
+- [x] **Blueprint construct** - Per-repo CDK configuration (model, max turns, prompt overrides, egress allowlist, GitHub token, Cedar policies, approval gate cap)
 - [x] **Repo-level project config** - Agent loads `CLAUDE.md`, `.claude/rules/`, `.claude/settings.json`, `.mcp.json`
-- [x] **Per-repo overrides** - Model ID, max turns, max budget, system prompt overrides, poll interval, dedicated token
+- [x] **Per-repo overrides** - Model ID, max turns, max budget (per-task request and/or `RepoTable`; Blueprint CDK default pending), system prompt overrides, poll interval, dedicated token
 
 ### Security
 
@@ -37,9 +39,10 @@ What's shipped and what's coming next.
 - [x] **Input guardrails** - Bedrock Guardrails screen task descriptions and PR/issue content (fail-closed)
 - [x] **Output screening** - Regex-based secret/PII scanner with PostToolUse hook redaction
 - [x] **Content sanitization** - HTML stripping, injection pattern neutralization, control character removal
-- [x] **Cedar policy engine** - Tool-call governance with fail-closed default and per-repo custom policies
+- [x] **Cedar policy engine and HITL gates** - Tool-call governance (allow / hard-deny / soft-deny requiring approval) with fail-closed default, per-repo Cedar policies, submit-time `initial_approvals`, `AWAITING_APPROVAL` state, `bgagent approve` / `deny` / `pending` / `policies`, and REST approval APIs. Stranded approvals in `AWAITING_APPROVAL` are cleared by the stranded-task reconciler. See [CEDAR_HITL_GATES.md](/architecture/cedar-hitl-gates)
 - [x] **WAF** - Managed rule groups + rate-based rule (1,000 req/5 min/IP)
 - [x] **Pre-flight checks** - GitHub API reachability, repo access, token permissions (fail-closed)
+- [x] **Per-session IAM scoping** - Agent assumes a per-task **SessionRole** via `sts:AssumeRole` with session tags `{user_id, repo, task_id}` and refreshable credentials (1-hour role-chaining cap; tasks up to 8 h). Tenant-data DynamoDB access uses `dynamodb:LeadingKeys = ${aws:PrincipalTag/task_id}`; S3 traces/attachments use a `${aws:PrincipalTag/user_id}` prefix. Bedrock model invocation still uses the compute role (see **Bedrock IAM session-tag attribution** under What's next). See [SECURITY.md](/architecture/security)
 - [x] **Model invocation logging** - Full prompt/response audit trail (90-day retention)
 
 ### Memory and learning
@@ -52,6 +55,7 @@ What's shipped and what's coming next.
 
 - [x] **Rich prompt assembly** - Task description + GitHub issue/PR content + memory context (~100K token budget)
 - [x] **Token budget management** - Oldest comments trimmed first; title/body always preserved
+- [x] **Task attachments (multimodal)** - `attachments` on create-task: inline base64 (≤ 500 KB), presigned upload (up to 10 MB), and URL fetch with SSRF protection. Images (PNG, JPEG) and text files (TXT, CSV, MD, JSON, PDF, LOG) pass through Guardrail screening, magic-bytes validation, and re-encoding. CLI `--attachment`, Slack file uploads, and Linear image extraction share the same schema. See [ATTACHMENTS.md](/architecture/attachments)
 
 ### Webhooks
 
@@ -69,7 +73,7 @@ What's shipped and what's coming next.
 - [x] **Real-time watch** - `bgagent watch` streams progress events with adaptive polling (500 ms active; 1/2/5 s idle backoff), cold-start retry, clean exit on terminal state
 - [x] **Mid-run steering (nudge)** - `bgagent nudge` sends guidance to a running agent; combined-turn acknowledgement (agent emits `nudge_acknowledged` before incorporating)
 - [x] **Execution tracing** - `--trace` on submit raises preview cap to 4 KB and uploads full gzipped NDJSON trajectory to S3; `bgagent trace download` retrieves it
-- [x] **Deterministic status snapshot** - `bgagent status` derives all fields from task record + recent events with no LLM in the loop
+- [x] **Deterministic status snapshot** - `bgagent status` shows operational fields (turn, last milestone, current tool/turn, cost) from the task record + recent events with no LLM in the loop—suited to ops/debug, not a narrative manager-style report (see **Smart progress updates** under What's next)
 - [x] **Debug output** - `--verbose` flag emits full HTTP request/response on stderr for any CLI command
 
 ### Notification plane
@@ -77,8 +81,15 @@ What's shipped and what's coming next.
 - [x] **DDB Stream fanout** - FanOut Consumer Lambda on TaskEventsTable streams (ParallelizationFactor: 1 for per-task ordering) routes events to channel dispatchers
 - [x] **GitHub edit-in-place** - Single status comment per task on the target PR, edited in place as progress events fire (phase, milestone, cost, link)
 - [x] **Routable agent milestones** - Named checkpoints (`pr_created`, `nudge_acknowledged`) unwrapped against allowlist for channel filter matching
-- [ ] **Slack dispatcher** - Log-only stub; pending full Slack Block Kit integration
+- [x] **Slack notification dispatcher** - FanOut Block Kit messages for Slack-origin tasks (lifecycle events, threaded replies, terminal dedup, in-thread cancel). Generic fallback text for unmapped event types (e.g. some milestones); richer milestone and approval-gate rendering is follow-up work
+- [x] **Deploy-preview screenshots** - Listens for GitHub `deployment_status: success` events from any provider (Vercel, Amplify Hosting, Netlify, GitHub Actions); captures the preview URL via AgentCore Browser; posts a markdown image comment on the open PR (and on the linked Linear issue if Linear is configured). Lambda-only, deterministic, ~10–15 s post-deploy. See [Deploy preview screenshots guide](/using/deploy-preview-screenshots-guide).
 - [ ] **Email dispatcher** - Log-only stub; pending SES integration
+
+### Channels
+
+- [x] **Slack integration** - @mention task submission, `bgagent slack link` / `setup`, file attachments on submit, threaded progress notifications. See [SLACK_SETUP_GUIDE.md](/using/slack-setup-guide)
+- [x] **Linear integration** - Label-triggered tasks, `bgagent linear setup` / `link`, progress comments on issues. See [LINEAR_SETUP_GUIDE.md](/using/linear-setup-guide)
+- [x] **Jira integration** - Label-triggered tasks on Jira Cloud, `bgagent jira setup` / `map` / `link`, progress comments via the Jira REST v3 API. See [JIRA_SETUP_GUIDE.md](/using/jira-setup-guide) and [ADR-015](/architecture/adr-015-jira-integration)
 
 ### Observability
 
@@ -114,9 +125,13 @@ Planned capabilities, grouped by theme. Items are independent and may ship in an
 
 | Capability | Description |
 |------------|-------------|
-| **Per-session IAM scoping** | Generate short-lived, scoped credentials per task via `sts:AssumeRole` with session tags (`user_id`, `repo`, `task_id`). DynamoDB leading-key conditions restrict each session to its own partition. Bedrock model access scoped to an explicit ARN allowlist instead of `*`. Eliminates cross-tenant blast radius from a compromised agent session. |
 | **Per-repo GitHub credentials** | GitHub App per org/repo via AgentCore Token Vault. Auto-refresh for long sessions. Sets the pattern for GitLab, Jira, Slack integrations. |
 | **Principal-to-repo authorization** | Map Cognito identities to allowed repository sets. Users can only trigger work on authorized repos. |
+| **End-to-end task attribution** | Propagate `task_id`, `user_id`, and trace context consistently across orchestrator logs, agent OpenTelemetry, GitHub/API calls, and `TaskEvents` so every downstream action is attributable in incident response (aligns with Zero Trust agent-identity guidance). |
+| **Emergency session containment** | Documented operator runbook and APIs: cancel task, terminate compute session, revoke short-lived credentials (assumed role, GitHub App token). Pairs with **Per-session IAM scoping**, **Per-repo GitHub credentials**, and **Behavioral circuit breaker** automated containment. |
+| **Delegation chain propagation** | Embed a cryptographically signed actor chain (`user_id → orchestrator → agent`) in credentials issued to the agent. Downstream services (GitHub commits, API calls) can trace any action back to the originating human principal. Enables per-action accountability, compliance audit, and fine-grained authorization decisions based on the full delegation lineage rather than only the immediate caller. |
+| **Workload-anchored credential binding** | Bind agent credentials to the specific MicroVM execution environment via attestation (e.g., instance identity document or platform-level workload identity). Credentials become non-transferable — unusable if exfiltrated from the VM. Complements per-session IAM scoping (which limits scope) with environment binding (which limits where credentials can be exercised). |
+| **Layered credential derivation** | Extend per-session scoping with a derivation model where each layer in the execution stack receives progressively narrower credentials. The orchestrator holds a task-scoped token; the agent runtime derives a further-restricted token limited to specific tools and repositories; tool invocations receive single-use or time-boxed tokens for each external call. Limits blast radius at every boundary, not just at task creation. |
 
 ### Agent quality
 
@@ -153,19 +168,27 @@ Planned capabilities, grouped by theme. Items are independent and may ship in an
 
 | Capability | Description |
 |------------|-------------|
-| **Behavioral circuit breaker** | Per-session limits on tool-call rate, cumulative cost, consecutive failures, and file churn; pause or terminate when thresholds are exceeded. Configurable per repo via Blueprint (design: `SECURITY.md`, `REPO_ONBOARDING.md`). |
+| **Behavioral circuit breaker** | Per-session limits on tool-call rate, cumulative cost, consecutive failures, and file churn; pause or terminate when thresholds are exceeded. On trip: terminate session, revoke short-lived credentials where applicable, emit a `containment` audit event. Configurable per repo via Blueprint (design: `SECURITY.md`, `REPO_ONBOARDING.md`). Prefer hard containment over friction-only limits (rate/turn caps alone). |
 | **Tool capability tiers** | Opt-in **extended** tool profile per repo: MCP servers, plugins, and additional Gateway-mediated tools beyond the default minimal surface (`COMPUTE.md`). Enforced at Gateway and policy layers. |
+| **MCP supply-chain controls** | For extended-tier repos: pin or self-host MCP servers; keep `.mcp.json` in version control; verify tool descriptors before enablement; no dynamic tool discovery in production blueprints. Mitigates tool poisoning and rug-pull risks (`SECURITY.md`, `COMPUTE.md`). |
+| **Untrusted hydration content boundaries** | Delimit external content in assembled prompts (issue/PR bodies, fetched URLs, review comments) so the model treats it as untrusted context (spotlighting-style framing). Complements Bedrock Guardrails at hydration time (`context-hydration.ts`). |
+
+### Interactive task UX
+
+| Capability | Description |
+|------------|-------------|
+| **Smart progress updates (manager-style status)** | Extend check-in beyond the shipped deterministic snapshot: human-readable progress that answers what the agent completed, what it plans next, and which decisions or blockers matter—surfaced via `bgagent status`, notification channels (GitHub/Slack/email), and the future control panel. Prefer structured agent-emitted progress events in `TaskEventsTable` (e.g. done / next / decisions / blockers) so all readers stay consistent and auditable; complement with Phase 2 **`bgagent ask`** for on-demand Q&A and an optional read-path **LLM-synthesized summary** over events (no agent turn) where cost/latency trade-offs are acceptable. Distinct from raw `watch`/`events` streams and from post-mortem **LLM-assisted trace analysis**. Design context: [INTERACTIVE_AGENTS.md](/architecture/interactive-agents). |
+| **`bgagent ask` (Phase 2)** | Mid-run questions to the agent (`POST /tasks/{id}/asks`); answers durable as `status_response` events with CLI block-and-poll. Enables interactive summaries (e.g. "what changed so far?") without a separate status API. Ships as part of the interactive check-in layer in [INTERACTIVE_AGENTS.md](/architecture/interactive-agents) Phase 2. |
+| **LLM-synthesized status summary (optional)** | Optional `bgagent status` mode where a Lambda narrates recent `TaskEvents` without waking the agent—deferred in design due to cost and hallucination risk; pursue behind a flag only if agent-authored progress reports are insufficient. Complements, does not replace, **Smart progress updates**. |
 
 ### Channels and integrations
 
 | Capability | Description |
 |------------|-------------|
-| **Task attachments (multimodal)** | Implement end-to-end support for the create-task **`attachments`** array (`API_CONTRACT.md`: `image`, `file`, `url` — inline base64 or fetchable URL, size/MIME limits). Flow through validation, guardrails, context hydration, and agent prompt so images (screenshots, mockups), documents, and linked assets reach the model where the channel allows it. Extend **CLI** and **webhook** task creation to populate the same schema. *Multimodal* is the vision/image path; attachments are the unified carrier for all non-text task context. |
 | **Additional git providers** | GitLab (and optionally Bitbucket). Same workflow, provider-specific API adapters. |
-| **Slack integration** | Submit tasks, check status, receive notifications from Slack. Block Kit rendering. |
-| **Control panel** | Web UI: task list, task detail with logs/traces, cancel, metrics dashboards, cost attribution. |
-| **Slack notification dispatcher** | Full Slack Block Kit rendering for the existing DDB-Stream fanout pipeline. Stub exists today (logs only). |
-| **Email notification dispatcher** | SES-based email notifications via the existing fanout pipeline. Stub exists today (logs only). |
+| **Slack notification polish** | Rich Block Kit for `agent_milestone` and `approval_requested` (today many map to generic fallback text); in-thread approve/deny buttons wired to HITL APIs. Should render **Smart progress updates** when that ships. |
+| **Control panel** | Web UI: task list, task detail with logs/traces, cancel, metrics dashboards, cost attribution. Task detail should show manager-style progress alongside raw events/traces. |
+| **Email notification dispatcher** | SES-based email notifications via the existing fanout pipeline. Log-only stub ships today (see unchecked **Email dispatcher** under What's ready). |
 | **Per-user notification preferences** | DynamoDB (or equivalent) store for preferred channels, per-channel config, and event filters (`INPUT_GATEWAY.md`). |
 | **Browser extension channel** | Lightweight extension to open tasks from GitHub issue/PR pages using existing webhook or OAuth-issued JWT; same internal message contract as other channels. |
 
@@ -173,8 +196,8 @@ Planned capabilities, grouped by theme. Items are independent and may ship in an
 
 | Capability | Description |
 |------------|-------------|
-| **Adaptive model router** | Per-turn model selection by complexity. Cheaper models for reads, Opus for complex reasoning. ~30-40% cost reduction. |
-| **Alternative compute** | ECS/Fargate or EKS via ComputeStrategy interface. For workloads exceeding AgentCore's 2 GB image limit or requiring GPU. |
+| **Adaptive model router** | Per-turn model selection by complexity. Cheaper models for reads, Opus for complex reasoning. ~30-40% cost reduction. Related: **Complexity-aware model router** under Cost governance. |
+| **Alternative compute** | ECS/Fargate or EKS via `ComputeStrategy` (`EcsComputeStrategy` exists; Agent stack wiring is commented out). For workloads exceeding AgentCore's 2 GB image limit or requiring GPU. |
 | **Environment pre-warming** | Pre-build container layers per repo. Snapshot-on-schedule (rebuild on push). Cold start from minutes to seconds. |
 | **S3-backed SDK session store (portable transcripts)** | Plumb the Claude Agent SDK `SessionStore` to S3 (dedicated bucket or prefix) with eager flush, IAM-scoped access, conditional part creates, checksums, adaptive retries, and structured logging. Emit metrics or alarms on transcript mirror failures; own graceful shutdown (`disconnect` on SIGTERM/cancel) so in-flight frames can flush. Persist `task_id` ↔ Claude session UUID (from the first `ResultMessage`) for resume on another worker; keep agent `cwd` stable so SDK-derived `project_key` paths stay predictable. Plan compaction when part count threatens resume latency; optional S3 Express One Zone when the fleet is single-AZ. Complements checked **Persistent session storage** (FUSE caches on `/mnt/workspace`) and end-of-task **trace** upload to `traces/...jsonl.gz`. |
 
@@ -195,24 +218,32 @@ Planned capabilities, grouped by theme. Items are independent and may ship in an
 
 | Capability | Description |
 |------------|-------------|
-| **Org and team budgets** | Per-user and per-team monthly token or USD budgets with alerting (e.g. 80%) and optional hard stop at 100%. |
-| **Complexity-aware model router** | Route each request to the most appropriate model based on task complexity (simple reads/edits to cheaper models, deeper reasoning to stronger models) while honoring budget and policy constraints. |
+| **Bedrock IAM session-tag attribution** | Route Bedrock **InvokeModel** through assumed credentials that carry `{user_id, repo, task_id}` session tags. **Per-session IAM scoping** (#209) already tags the SessionRole for DynamoDB/S3; model calls still use the AgentCore/ECS compute role today. Extend `aws_session.py` (or equivalent) so inference is chargeable in Cost Explorer / CUR 2.0 by principal tag. Operator must activate IAM principal cost allocation tags (see [COST_MODEL.md](/architecture/cost-model#cost-attribution)). |
+| **Bedrock per-request metadata** | Pass `task_id`, `user_id`, and `repo` on each Bedrock call via request metadata / `X-Amzn-Bedrock-Request-Metadata` into model invocation logs. Complements IAM attribution; does not replace in-app `cost_usd`. Requires Claude Code / SDK support for metadata on InvokeModel. |
+| **Cost dashboard and export API** | Log Insights widgets on invocation logs; optional API or export for monthly spend roll-ups by `user_id` / `repo` from the task table. Operator dashboard today covers task-level cost aggregates, not Bedrock chargeback dimensions. |
+| **Optional tagged application inference profiles** | CDK-managed Bedrock application inference profiles per onboarded repo or environment; set `ANTHROPIC_MODEL` to tagged profile ARN for `resourceTags/*` billing when repo count is bounded. |
+| **Org and team budgets** | Per-user and per-team monthly token or USD budgets with alerting (e.g. 80%) and optional hard stop at 100%. Per-task `max_budget_usd` and turn caps ship today. |
+| **Complexity-aware model router** | Route each request to the most appropriate model based on task complexity (simple reads/edits to cheaper models, deeper reasoning to stronger models) while honoring budget and policy constraints. Related: **Adaptive model router** under Compute and performance. |
 
 ### Observability and safe deploy
 
 | Capability | Description |
 |------------|-------------|
+| **Deployed runtime E2E verification** | **Phase 0 landed:** `@aws-cdk/integ-tests-alpha` + `integ-runner` deploy a trimmed Task API stack to a real account, assert the create-and-persist happy path (task persists at `SUBMITTED`), then tear it down (`mise //cdk:integ`). In CI it runs per-PR via `workflow_run` when the diff touches `cdk/**` or `agent/**`, behind the `integ` environment's admin-approval gate, and posts a required `integ-smoke` status that blocks merge (`workflow_dispatch` retained for manual runs). Phase 1 (full lifecycle / real agent runs) and Phase 2 (channels) follow. See [ADR-013](/architecture/adr-013-tiered-validation-pyramid). |
 | **Admission backlog observability** | Metric and alarm when `SUBMITTED` task depth exceeds an operator threshold (capacity and admission health). |
 | **Admission queue with deferred pickup** | When admission is at capacity, persist tasks in a durable queue instead of failing them. Automatically re-attempt admission and continue processing in FIFO order (with optional priority lanes) as concurrency becomes available. Preserve cancel/idempotency semantics and expose queue position/ETA in task status. |
 | **Safe orchestrator deploys** | Pre-deploy checks for active tasks (drain or warn); blue-green or canary Lambda deploy for the durable orchestrator with rollback on error regressions (`OBSERVABILITY.md`). |
+| **Unified cross-plane trace correlation** | Single trace root per task across orchestrator, MicroVM OpenTelemetry, `TaskEvents`, and S3 trace artifacts. Gap-fill beyond existing AgentCore session baggage (`OBSERVABILITY.md`). |
+| **Immutable audit export** | Append-only export of `TaskEvents` and policy decisions to S3 (e.g. Object Lock). Complements **Centralized policy framework** `PolicyDecisionEvent` schema for compliance and tamper-evident investigation. |
+| **Security operations metrics (dwell time and coverage)** | CloudWatch metrics and dashboard panels: time from anomaly (circuit breaker, guardrail spike, policy deny burst) to operator awareness; fraction of security/ops alarms investigated. Targets shortened exploit windows. |
+| **Automated alert first-pass triage** | On selected security/ops alarms, a Lambda produces a structured disposition from logs, traces, and `TaskEvents` before human review. Distinct from **LLM-assisted trace analysis** (post-mortem on failed tasks). |
 
 ### Scale and collaboration
 
 | Capability | Description |
 |------------|-------------|
 | **Multi-user and teams** | Team visibility, shared approval queues, team concurrency/cost budgets, memory isolation. |
-| **Agent swarm** | Planner-worker architecture for complex multi-file tasks. DAG of subtasks, merge orchestrator, one consolidated PR. |
-| **Cedar-driven HITL approval gates** | Three-outcome model (allow/hard-deny/soft-deny) for tool-call governance with Cedar policy engine. |
+| **Agent swarm** | Planner-worker architecture for complex multi-file tasks. DAG of subtasks, merge orchestrator, one consolidated PR. Workers receive a strict subset of planner credentials; orchestrator-issued subtask intent; per-worker OpenTelemetry spans under a shared trace root (prevents confused-deputy / unscoped privilege inheritance). |
 | **Multi-user nudge** | Extend `bgagent nudge` to support multiple users injecting context into the same running task. Per-nudge commit attribution. (Single-user nudge shipped.) |
 | **Scheduled triggers** | Cron-based task creation via EventBridge (dependency updates, nightly flaky test checks). |
 
@@ -229,8 +260,20 @@ Planned capabilities, grouped by theme. Items are independent and may ship in an
 | **EventBridge / SNS integration** | Publish task lifecycle events to EventBridge or SNS for external consumers beyond the built-in DDB-Stream fanout (which already powers GitHub edit-in-place, Slack, and email dispatchers). |
 | **CDK constructs library** | Publish reusable constructs to Construct Hub with semver versioning. |
 | **Centralized policy framework** | Unified Cedar-based framework with `PolicyDecisionEvent` audit schema. Three enforcement modes with observe-before-enforce rollout. |
+| **Zero Trust control review ("impossible vs tedious")** | Document a standing design test in `SECURITY.md`: prefer controls that remove capability over friction-only mitigations (rate limits, observe-only DNS). Use when prioritizing DNS enforcement, credential scoping, and containment vs. throttling. |
 | **Formal verification** | TLA+ specification of task state machine, concurrency, cancellation races, reconciler interleavings. |
+
+### Agent asset registry
+
+| Capability | Description |
+|------------|-------------|
+| **Central asset registry** | A versioned, platform-managed registry from which agents resolve assets at runtime instead of requiring them to be vendored in source. Assets include skills, plugins, MCP server definitions, capabilities (Change Manifest verification strategies, knowledge tool configurations), custom prompt fragments, and Cedar policy modules. The registry is the single source of truth the Change Manifest's L1 (`tool_needed` validation) and L5 (knowledge resolution) evaluate against — replacing the implicit "known tool registry" currently assumed in the design. Backed by DynamoDB (metadata + version index) with S3 (artifact storage). |
+| **Asset versioning and immutability** | Every asset version is immutable once published. Blueprints pin asset versions explicitly (no floating `latest` in production). Version resolution follows semver constraints. Rollback is a re-pin to a prior version, not mutation. Enables reproducible agent executions and safe rollout of new tool versions without affecting running tasks. |
+| **Asset lifecycle management** | Publish, deprecate, and retire flow for registry assets. Deprecation emits warnings in task telemetry when a pinned asset version is nearing end-of-life. Retirement blocks new task starts that reference the asset. Operator API for bulk migration (re-pin all blueprints from v1 to v2). |
+| **Capability descriptors** | Structured metadata per registry asset declaring what the asset provides (tool surface, permissions required, resource limits, Cedar actions it introduces) and what it requires (runtime dependencies, network egress domains, minimum compute profile). The agent runtime uses descriptors to configure the execution environment dynamically — enabling MCP servers, injecting context, and adjusting sandbox permissions based on resolved capabilities rather than static blueprint lists. |
+| **Blueprint registry references** | Extend the Blueprint construct so `knowledge_tools`, `mcp_servers`, tool profiles, and capability configurations reference registry asset identifiers and version constraints instead of inline definitions. At task start the orchestrator resolves pinned versions from the registry, fetches artifacts, and provisions the agent environment. Decouples asset authoring from infrastructure deployment. |
+| **Registry access control** | Cedar policies govern who can publish, deprecate, or pin assets. Scoped by asset type and namespace (e.g., org-private vs. platform-provided). Read access (resolution at task start) is unrestricted within the deployment; write access requires operator or publisher role. |
 
 ---
 
-Design docs to keep in sync: [ARCHITECTURE.md](/architecture/architecture), [ORCHESTRATOR.md](/architecture/orchestrator), [API_CONTRACT.md](/architecture/api-contract), [INPUT_GATEWAY.md](/architecture/input-gateway), [REPO_ONBOARDING.md](/architecture/repo-onboarding), [MEMORY.md](/architecture/memory), [OBSERVABILITY.md](/architecture/observability), [COMPUTE.md](/architecture/compute), [SECURITY.md](/architecture/security), [EVALUATION.md](/architecture/evaluation).
+Design docs to keep in sync: [ARCHITECTURE.md](/architecture/architecture), [ORCHESTRATOR.md](/architecture/orchestrator), [API_CONTRACT.md](/architecture/api-contract), [ATTACHMENTS.md](/architecture/attachments), [CEDAR_HITL_GATES.md](/architecture/cedar-hitl-gates), [INPUT_GATEWAY.md](/architecture/input-gateway), [INTERACTIVE_AGENTS.md](/architecture/interactive-agents), [REPO_ONBOARDING.md](/architecture/repo-onboarding), [MEMORY.md](/architecture/memory), [OBSERVABILITY.md](/architecture/observability), [COMPUTE.md](/architecture/compute), [SECURITY.md](/architecture/security), [EVALUATION.md](/architecture/evaluation).

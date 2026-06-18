@@ -30,12 +30,15 @@ def get_disk_usage(path: str = AGENT_WORKSPACE) -> float:
         return 0
 
 
+_BYTES_PER_UNIT = 1024
+
+
 def format_bytes(size: float) -> str:
     """Human-readable byte size."""
     for unit in ("B", "KB", "MB", "GB"):
-        if abs(size) < 1024:
+        if abs(size) < _BYTES_PER_UNIT:
             return f"{size:.1f} {unit}"
-        size /= 1024
+        size /= _BYTES_PER_UNIT
     return f"{size:.1f} TB"
 
 
@@ -450,10 +453,10 @@ def upload_trace_to_s3(
 
     key = f"traces/{user_id}/{task_id}.jsonl.gz"
     try:
-        import boto3
+        from aws_session import tenant_client
 
         region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-        client = boto3.client("s3", region_name=region)
+        client = tenant_client("s3", region_name=region)
         # Intentionally omit ContentEncoding=gzip: Node's fetch (undici) auto-
         # decompresses responses whose metadata declares gzip encoding, which
         # violates the CLI's `-o <file>` "raw gzipped bytes" contract and
@@ -468,6 +471,7 @@ def upload_trace_to_s3(
         return f"s3://{bucket}/{key}"
     except ImportError:
         print("[trace/upload] boto3 not available — skipping", flush=True)
+        # nosemgrep: py-silent-success-masking -- trace upload optional; missing boto3 skips upload
         return None
     except Exception as e:
         exc_type = type(e).__name__
@@ -481,19 +485,49 @@ def upload_trace_to_s3(
                 "[trace/upload] WARNING: IAM misconfiguration likely — trace artifact is lost.",
                 flush=True,
             )
+        # nosemgrep: py-silent-success-masking -- S3 trace upload best-effort; failure logged
         return None
 
 
-# Values under these keys may contain tool stderr, paths, or incidental secrets.
-_METRICS_REDACT_KEYS = frozenset({"error"})
+# Values under these keys are scanned for secret patterns before emission.
+# Previously these fields were blanket-redacted to ``"[redacted]"``, which
+# swallowed legitimate structural errors (e.g. ``missing built-in hard-deny
+# policies: /app/policies/hard_deny.cedar``) whose diagnostic value is
+# high and secret-risk is zero. See E2E 2026-05-11 T2.2 for the incident.
+# The new policy runs ``scan_tool_output`` over the value and only
+# substitutes ``[REDACTED-<LABEL>]`` on a real pattern match.
+_METRICS_SCAN_KEYS = frozenset({"error"})
 
 
 def _metrics_payload_for_logging(metrics: dict) -> dict:
-    """Build metrics dict for stdout / CloudWatch JSON (redacts sensitive fields)."""
+    """Build metrics dict for stdout / CloudWatch JSON.
+
+    For keys listed in ``_METRICS_SCAN_KEYS`` (currently just ``error``),
+    the value is passed through ``output_scanner.scan_tool_output``:
+    - Secret-like patterns (AWS keys, Bearer tokens, connection strings,
+      etc.) are substituted with ``[REDACTED-<LABEL>]`` markers in-place.
+    - Error strings with no secret patterns pass through unchanged so
+      diagnostic text like ``missing built-in hard-deny policies: ...``
+      remains visible to the dashboard's Recent-Events widget.
+
+    Non-string values (bool/int/float/None) skip the scanner. All other
+    values are coerced via ``str()``.
+    """
+    # Lazy import: output_scanner is only needed on the logging path and
+    # we want telemetry importable even in minimal test environments.
+    from output_scanner import scan_tool_output
+
     out: dict = {}
     for k, v in metrics.items():
-        if k in _METRICS_REDACT_KEYS:
-            out[k] = None if v is None else "[redacted]"
+        if k in _METRICS_SCAN_KEYS:
+            if v is None:
+                out[k] = None
+            elif isinstance(v, (bool, int, float)):
+                # Primitives can't carry secret patterns; pass through.
+                out[k] = v
+            else:
+                scanned = scan_tool_output(str(v))
+                out[k] = scanned.redacted_content
             continue
         if isinstance(v, (bool, int, float, type(None))):
             out[k] = v

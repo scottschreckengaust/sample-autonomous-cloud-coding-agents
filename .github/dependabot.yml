@@ -1,0 +1,77 @@
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "saturday"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps): actions"
+    open-pull-requests-limit: 1
+    groups:
+      all-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: "docker"
+    directories:
+      - "**/*"
+    schedule:
+      interval: "weekly"
+      day: "saturday"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps): docker"
+    open-pull-requests-limit: 1
+    groups:
+      all-docker:
+        patterns: ["*"]
+
+  - package-ecosystem: "uv"
+    directories:
+      - "**/*"
+    schedule:
+      interval: "weekly"
+      day: "saturday"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps): uv"
+    open-pull-requests-limit: 1
+    groups:
+      all-python:
+        patterns: ["*"]
+    ignore:
+      # Cedar engine parity — bump in lockstep with @cedar-policy/cedar-wasm via a
+      # dedicated coordinated PR. See docs/design/CEDAR_HITL_GATES.md §15.6 (decision #23).
+      - dependency-name: "cedarpy"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
+
+  - package-ecosystem: "npm"
+    directories:
+      - "**/*"
+    schedule:
+      interval: "weekly"
+      day: "saturday"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps): npm"
+    open-pull-requests-limit: 1
+    groups:
+      all-npm:
+        patterns: ["*"]
+    ignore:
+      # Cedar engine parity — bump in lockstep with cedarpy via a dedicated
+      # coordinated PR. See docs/design/CEDAR_HITL_GATES.md §15.6 (decision #23).
+      - dependency-name: "@cedar-policy/cedar-wasm"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"

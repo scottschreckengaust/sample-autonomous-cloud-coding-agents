@@ -27,6 +27,24 @@ import * as lambda from 'aws-cdk-lib/aws-lambda-nodejs';
 import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
 
+/** Default stranded-timeout (seconds; 20 minutes). */
+const DEFAULT_STRANDED_TIMEOUT_SECONDS = 1200;
+
+/** Default approval-stranded timeout (seconds; 2 hours). */
+const DEFAULT_APPROVAL_STRANDED_TIMEOUT_SECONDS = 7200;
+
+/** Default task-record retention used for event TTL (days). */
+const DEFAULT_TASK_RETENTION_DAYS = 90;
+
+/** Reconciler Lambda timeout (minutes). */
+const RECONCILER_TIMEOUT_MINUTES = 5;
+
+/** Reconciler Lambda memory (MB). */
+const RECONCILER_MEMORY_MB = 256;
+
+/** Default reconciliation schedule interval (minutes). */
+const DEFAULT_SCHEDULE_MINUTES = 5;
+
 /**
  * Properties for StrandedTaskReconciler construct.
  */
@@ -58,6 +76,17 @@ export interface StrandedTaskReconcilerProps {
    */
   readonly strandedTimeoutSeconds?: number;
 
+  /**
+   * Cedar HITL approval-stranded timeout (seconds). Tasks in
+   * AWAITING_APPROVAL older than this are transitioned to FAILED.
+   * Longer than the stranded-timeout because approvals legitimately
+   * sit for up to an hour (§7.3). Set via
+   * ``APPROVAL_STRANDED_TIMEOUT_SECONDS``.
+   *
+   * @default 7200 (2 hours — double §7.3's 1-hour ceiling + an hour grace)
+   */
+  readonly approvalStrandedTimeoutSeconds?: number;
+
   /** Forwarded to the handler for event TTL. @default 90 */
   readonly taskRetentionDays?: number;
 }
@@ -82,21 +111,23 @@ export class StrandedTaskReconciler extends Construct {
 
     const handlersDir = path.join(__dirname, '..', 'handlers');
 
-    const strandedTimeout = props.strandedTimeoutSeconds ?? 1200;
-    const retentionDays = props.taskRetentionDays ?? 90;
+    const strandedTimeout = props.strandedTimeoutSeconds ?? DEFAULT_STRANDED_TIMEOUT_SECONDS;
+    const approvalStrandedTimeout = props.approvalStrandedTimeoutSeconds ?? DEFAULT_APPROVAL_STRANDED_TIMEOUT_SECONDS;
+    const retentionDays = props.taskRetentionDays ?? DEFAULT_TASK_RETENTION_DAYS;
 
     this.fn = new lambda.NodejsFunction(this, 'ReconcilerFn', {
       entry: path.join(handlersDir, 'reconcile-stranded-tasks.ts'),
       handler: 'handler',
       runtime: Runtime.NODEJS_24_X,
       architecture: Architecture.ARM_64,
-      timeout: Duration.minutes(5),
-      memorySize: 256,
+      timeout: Duration.minutes(RECONCILER_TIMEOUT_MINUTES),
+      memorySize: RECONCILER_MEMORY_MB,
       environment: {
         TASK_TABLE_NAME: props.taskTable.tableName,
         TASK_EVENTS_TABLE_NAME: props.taskEventsTable.tableName,
         USER_CONCURRENCY_TABLE_NAME: props.userConcurrencyTable.tableName,
         STRANDED_TIMEOUT_SECONDS: String(strandedTimeout),
+        APPROVAL_STRANDED_TIMEOUT_SECONDS: String(approvalStrandedTimeout),
         TASK_RETENTION_DAYS: String(retentionDays),
       },
       bundling: {
@@ -112,7 +143,7 @@ export class StrandedTaskReconciler extends Construct {
     // Concurrency: decrement active_count on fail.
     props.userConcurrencyTable.grantReadWriteData(this.fn);
 
-    const schedule = props.schedule ?? Duration.minutes(5);
+    const schedule = props.schedule ?? Duration.minutes(DEFAULT_SCHEDULE_MINUTES);
     const rule = new events.Rule(this, 'ReconcilerSchedule', {
       schedule: events.Schedule.rate(schedule),
     });

@@ -39,10 +39,28 @@ jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
   ApplyGuardrailCommand: jest.fn((input: unknown) => ({ _type: 'ApplyGuardrail', input })),
 }));
 
-const mockCheckRepoOnboarded = jest.fn();
+// create-task-core collapsed the prior checkRepoOnboarded +
+// loadRepoConfig pair into a single ``lookupRepo`` call (see
+// ``cdk/src/handlers/shared/repo-config.ts::lookupRepo``). The mock
+// exposes the one function the submit path now calls; the two
+// convenience wrappers are still exported on the real module but
+// create-task-core doesn't reach for them, so leaving them off the
+// mock keeps test failures load-bearing if the import surface
+// drifts.
+const mockLookupRepo = jest.fn();
 jest.mock('../../../src/handlers/shared/repo-config', () => ({
-  checkRepoOnboarded: mockCheckRepoOnboarded,
+  lookupRepo: mockLookupRepo,
 }));
+
+// Partial-mock the workflows module: keep every real resolver/descriptor, but
+// make ``disallowedWorkflowModel`` controllable so the rule-13 admission path
+// can be exercised without shipping a workflow that pins a bad model. Defaults
+// to the real implementation (null for all shipped workflows) via beforeEach.
+const mockDisallowedWorkflowModel = jest.fn();
+jest.mock('../../../src/handlers/shared/workflows', () => {
+  const actual = jest.requireActual('../../../src/handlers/shared/workflows');
+  return { ...actual, disallowedWorkflowModel: mockDisallowedWorkflowModel };
+});
 
 let ulidCounter = 0;
 jest.mock('ulid', () => ({ ulid: jest.fn(() => `ULID${ulidCounter++}`) }));
@@ -72,7 +90,12 @@ beforeEach(() => {
   mockSend.mockResolvedValue({});
   mockLambdaSend.mockResolvedValue({});
   mockBedrockSend.mockResolvedValue({ action: 'NONE' });
-  mockCheckRepoOnboarded.mockResolvedValue({ onboarded: true });
+  // Default: repo is onboarded, no blueprint config (submit path
+  // resolves to the platform-default approval_gate_cap of 50).
+  mockLookupRepo.mockResolvedValue({ onboarded: true, config: null });
+  // Default: the resolved workflow's model is permitted (matches the real
+  // implementation for every shipped workflow). Rule-13 tests override this.
+  mockDisallowedWorkflowModel.mockReturnValue(null);
 });
 
 describe('createTaskCore', () => {
@@ -95,6 +118,102 @@ describe('createTaskCore', () => {
     const result = await createTaskCore({ repo: 'invalid' } as any, makeContext(), 'req-1');
     expect(result.statusCode).toBe(400);
     expect(JSON.parse(result.body).error.code).toBe('VALIDATION_ERROR');
+  });
+
+  test('accepts a repo-less submission (#248 Phase 3)', async () => {
+    // No repo + the repo-optional default workflow ⇒ 201, no onboarding lookup,
+    // no repo persisted on the record.
+    const result = await createTaskCore(
+      { workflow_ref: 'default/agent-v1', task_description: 'Summarise these papers' },
+      makeContext(),
+      'req-1',
+    );
+    expect(result.statusCode).toBe(201);
+    const body = JSON.parse(result.body);
+    expect(body.data.status).toBe('SUBMITTED');
+    expect(body.data.repo).toBeNull();
+    // Repo-less ⇒ the onboarding/blueprint RepoTable lookup is skipped entirely.
+    expect(mockLookupRepo).not.toHaveBeenCalled();
+    expect(mockSend).toHaveBeenCalledTimes(2); // task + event
+  });
+
+  test('returns 400 for an unsatisfiable @version pin (#296 finding #6)', async () => {
+    const result = await createTaskCore(
+      { repo: 'org/repo', task_description: 'Fix it', workflow_ref: 'coding/new-task-v1@2.0.0' },
+      makeContext(),
+      'req-1',
+    );
+    expect(result.statusCode).toBe(400);
+    const body = JSON.parse(result.body);
+    expect(body.error.code).toBe('VALIDATION_ERROR');
+    expect(body.error.message).toContain('not available');
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  test('returns 400 when a repo-bound workflow is missing its repo (#248 Phase 3)', async () => {
+    const result = await createTaskCore(
+      { workflow_ref: 'coding/new-task-v1', task_description: 'Fix it' },
+      makeContext(),
+      'req-1',
+    );
+    expect(result.statusCode).toBe(400);
+    expect(JSON.parse(result.body).error.message).toContain('repo');
+  });
+
+  test('rejects a malformed repo on a repo-bound workflow (#248 Phase 3)', async () => {
+    // The repo-present-but-malformed branch: a repo-bound workflow with a
+    // bad-format repo is a 400 with the new "Invalid repo." message.
+    const result = await createTaskCore(
+      { workflow_ref: 'coding/new-task-v1', repo: 'not-a-repo', task_description: 'Fix it' } as any,
+      makeContext(),
+      'req-1',
+    );
+    expect(result.statusCode).toBe(400);
+    expect(JSON.parse(result.body).error.message).toContain('Invalid repo');
+  });
+
+  test('repo-OPTIONAL workflow given a valid repo runs the repo-bound path (#248 Phase 3)', async () => {
+    // default/agent-v1 is repo-optional; when a repo IS supplied it must still
+    // be onboarded-checked and persisted (requires_repo:false means optional,
+    // not forbidden).
+    const result = await createTaskCore(
+      { workflow_ref: 'default/agent-v1', repo: 'org/repo', task_description: 'Do it' },
+      makeContext(),
+      'req-1',
+    );
+    expect(result.statusCode).toBe(201);
+    const body = JSON.parse(result.body);
+    expect(body.data.repo).toBe('org/repo');
+    // Repo present ⇒ the onboarding/blueprint lookup DID run.
+    expect(mockLookupRepo).toHaveBeenCalledWith('org/repo');
+  });
+
+  test('returns 400 when the resolved workflow pins a disallowed model (rule 13)', async () => {
+    // WORKFLOWS.md rule 13: a workflow whose agent_config.model.id is not on the
+    // platform allow-list FAILS admission (no silent downgrade).
+    mockDisallowedWorkflowModel.mockReturnValue('anthropic.some-unapproved-model');
+    const result = await createTaskCore(
+      { repo: 'org/repo', task_description: 'Fix the bug' },
+      makeContext(),
+      'req-1',
+    );
+    expect(result.statusCode).toBe(400);
+    const body = JSON.parse(result.body);
+    expect(body.error.code).toBe('VALIDATION_ERROR');
+    expect(body.error.message).toContain('not on the platform allow-list');
+    // Rejected at admission — no task/event writes, no orchestrator invoke.
+    expect(mockSend).not.toHaveBeenCalled();
+    expect(mockLambdaSend).not.toHaveBeenCalled();
+  });
+
+  test('admits a task when the resolved workflow model is permitted (rule 13 pass)', async () => {
+    mockDisallowedWorkflowModel.mockReturnValue(null);
+    const result = await createTaskCore(
+      { repo: 'org/repo', task_description: 'Fix the bug' },
+      makeContext(),
+      'req-1',
+    );
+    expect(result.statusCode).toBe(201);
   });
 
   test('returns 400 when no task spec', async () => {
@@ -131,7 +250,7 @@ describe('createTaskCore', () => {
       user_id: 'user-123',
       status: 'SUBMITTED',
       repo: 'org/repo',
-      task_type: 'new_task',
+      resolved_workflow: { id: 'coding/new-task-v1', version: '1.0.0' },
       task_description: 'Original work',
       branch_name: 'bgagent/existing/slug',
       channel_source: 'api',
@@ -168,7 +287,7 @@ describe('createTaskCore', () => {
           user_id: 'other-user',
           status: 'SUBMITTED',
           repo: 'org/repo',
-          task_type: 'new_task',
+          resolved_workflow: { id: 'coding/new-task-v1', version: '1.0.0' },
           branch_name: 'bgagent/existing/slug',
           channel_source: 'api',
           status_created_at: 'SUBMITTED#2020-01-01T00:00:00.000Z',
@@ -366,7 +485,7 @@ describe('createTaskCore', () => {
 
   test('returns 400 when task_description exceeds length limit', async () => {
     const result = await createTaskCore(
-      { repo: 'org/repo', task_description: 'a'.repeat(2001) },
+      { repo: 'org/repo', task_description: 'a'.repeat(10_001) },
       makeContext(),
       'req-1',
     );
@@ -376,7 +495,7 @@ describe('createTaskCore', () => {
 
   test('accepts task_description at exactly the length limit', async () => {
     const result = await createTaskCore(
-      { repo: 'org/repo', task_description: 'a'.repeat(2000) },
+      { repo: 'org/repo', task_description: 'a'.repeat(10_000) },
       makeContext(),
       'req-1',
     );
@@ -384,7 +503,7 @@ describe('createTaskCore', () => {
   });
 
   test('returns 422 when repo is not onboarded', async () => {
-    mockCheckRepoOnboarded.mockResolvedValueOnce({ onboarded: false });
+    mockLookupRepo.mockResolvedValueOnce({ onboarded: false, config: null });
     const result = await createTaskCore(
       { repo: 'org/repo', task_description: 'Fix it' },
       makeContext(),
@@ -395,7 +514,7 @@ describe('createTaskCore', () => {
   });
 
   test('creates task successfully when repo is onboarded', async () => {
-    mockCheckRepoOnboarded.mockResolvedValueOnce({ onboarded: true });
+    mockLookupRepo.mockResolvedValueOnce({ onboarded: true, config: null });
     const result = await createTaskCore(
       { repo: 'org/repo', task_description: 'Fix the bug' },
       makeContext(),
@@ -404,30 +523,42 @@ describe('createTaskCore', () => {
     expect(result.statusCode).toBe(201);
   });
 
-  test('creates pr_iteration task with pr_number', async () => {
+  test('resolves the default workflow when workflow_ref is omitted', async () => {
     const result = await createTaskCore(
-      { repo: 'org/repo', task_type: 'pr_iteration', pr_number: 42 },
+      { repo: 'org/repo', task_description: 'Fix the bug' },
+      makeContext(),
+      'req-default',
+    );
+    expect(result.statusCode).toBe(201);
+    const body = JSON.parse(result.body);
+    // No workflow_ref ⇒ the resolution ladder falls to the platform default.
+    expect(body.data.resolved_workflow).toEqual({ id: 'default/agent-v1', version: '1.0.0' });
+  });
+
+  test('creates a pr-iteration workflow task with pr_number', async () => {
+    const result = await createTaskCore(
+      { repo: 'org/repo', workflow_ref: 'coding/pr-iteration-v1', pr_number: 42 },
       makeContext(),
       'req-pr-1',
     );
     expect(result.statusCode).toBe(201);
     const body = JSON.parse(result.body);
-    expect(body.data.task_type).toBe('pr_iteration');
+    expect(body.data.resolved_workflow).toEqual({ id: 'coding/pr-iteration-v1', version: '1.0.0' });
     expect(body.data.pr_number).toBe(42);
     expect(body.data.branch_name).toBe('pending:pr_resolution');
   });
 
-  test('returns 400 for pr_iteration without pr_number', async () => {
+  test('returns 400 for a pr workflow without pr_number', async () => {
     const result = await createTaskCore(
-      { repo: 'org/repo', task_type: 'pr_iteration', task_description: 'Fix it' },
+      { repo: 'org/repo', workflow_ref: 'coding/pr-iteration-v1', task_description: 'Fix it' },
       makeContext(),
       'req-pr-2',
     );
     expect(result.statusCode).toBe(400);
-    expect(result.body).toContain('pr_number is required');
+    expect(result.body).toContain('pr_number');
   });
 
-  test('returns 400 for pr_number without pr_iteration task_type', async () => {
+  test('returns 400 for pr_number on a non-pr workflow', async () => {
     const result = await createTaskCore(
       { repo: 'org/repo', task_description: 'Fix it', pr_number: 42 } as any,
       makeContext(),
@@ -437,47 +568,47 @@ describe('createTaskCore', () => {
     expect(result.body).toContain('pr_number is only allowed');
   });
 
-  test('returns 400 for invalid task_type', async () => {
+  test('returns 400 for an unknown workflow_ref', async () => {
     const result = await createTaskCore(
-      { repo: 'org/repo', task_description: 'Fix it', task_type: 'invalid' as any },
+      { repo: 'org/repo', task_description: 'Fix it', workflow_ref: 'coding/does-not-exist-v1' },
       makeContext(),
       'req-pr-4',
     );
     expect(result.statusCode).toBe(400);
-    expect(result.body).toContain('Invalid task_type');
+    expect(result.body).toContain('Unknown workflow_ref');
   });
 
-  test('creates pr_review task with pr_number', async () => {
+  test('returns 400 for a malformed workflow_ref', async () => {
     const result = await createTaskCore(
-      { repo: 'org/repo', task_type: 'pr_review', pr_number: 99 },
+      { repo: 'org/repo', task_description: 'Fix it', workflow_ref: 'not-a-valid-ref' },
+      makeContext(),
+      'req-pr-4b',
+    );
+    expect(result.statusCode).toBe(400);
+    expect(result.body).toContain('Invalid workflow_ref');
+  });
+
+  test('creates a pr-review workflow task with pr_number', async () => {
+    const result = await createTaskCore(
+      { repo: 'org/repo', workflow_ref: 'coding/pr-review-v1', pr_number: 99 },
       makeContext(),
       'req-review-1',
     );
     expect(result.statusCode).toBe(201);
     const body = JSON.parse(result.body);
-    expect(body.data.task_type).toBe('pr_review');
+    expect(body.data.resolved_workflow).toEqual({ id: 'coding/pr-review-v1', version: '1.0.0' });
     expect(body.data.pr_number).toBe(99);
     expect(body.data.branch_name).toBe('pending:pr_resolution');
   });
 
-  test('returns 400 for pr_review without pr_number', async () => {
+  test('returns 400 for a pr-review workflow without pr_number', async () => {
     const result = await createTaskCore(
-      { repo: 'org/repo', task_type: 'pr_review', task_description: 'Review it' },
+      { repo: 'org/repo', workflow_ref: 'coding/pr-review-v1', task_description: 'Review it' },
       makeContext(),
       'req-review-2',
     );
     expect(result.statusCode).toBe(400);
-    expect(result.body).toContain('pr_number is required');
-  });
-
-  test('returns 400 for pr_number with new_task', async () => {
-    const result = await createTaskCore(
-      { repo: 'org/repo', task_description: 'Fix it', pr_number: 42 } as any,
-      makeContext(),
-      'req-review-3',
-    );
-    expect(result.statusCode).toBe(400);
-    expect(result.body).toContain('pr_number is only allowed');
+    expect(result.body).toContain('pr_number');
   });
 
   // -- trace flag (design §10.1) --------------------------------------
@@ -550,5 +681,136 @@ describe('createTaskCore', () => {
     );
     expect(result.statusCode).toBe(400);
     expect(JSON.parse(result.body).error.message).toContain('trace');
+  });
+
+  // --- Chunk 7b: approval_gate_cap resolution (§4 step 5, decision #13) ---
+
+  function getPersistedTaskRecord() {
+    const putCall = mockSend.mock.calls.find(
+      (c: any) => c[0]?._type === 'Put' && c[0]?.input?.TableName === 'Tasks',
+    );
+    return putCall?.[0]?.input?.Item;
+  }
+
+  // Wrap the ``lookupRepo`` mock for the "onboarded + config" case
+  // used by every blueprint-cap test below. Keeps each test focused
+  // on the cap value under test rather than repeating the full
+  // RepoConfig shape.
+  function mockOnboardedWithConfig(config: Record<string, unknown>): void {
+    mockLookupRepo.mockResolvedValueOnce({
+      onboarded: true,
+      config: {
+        repo: 'org/repo',
+        status: 'active',
+        onboarded_at: '2024-01-01T00:00:00Z',
+        updated_at: '2024-01-01T00:00:00Z',
+        ...config,
+      },
+    });
+  }
+
+  test('persists default approval_gate_cap of 50 when blueprint omits the override', async () => {
+    mockLookupRepo.mockResolvedValueOnce({ onboarded: true, config: null });
+    const result = await createTaskCore(
+      { repo: 'org/repo', task_description: 'x' },
+      makeContext(),
+      'req-cap-default',
+    );
+    expect(result.statusCode).toBe(201);
+    const record = getPersistedTaskRecord();
+    expect(record.approval_gate_cap).toBe(50);
+  });
+
+  test('persists default-50 when RepoConfig exists but lacks approval_gate_cap', async () => {
+    // Legacy blueprint predating Chunk 7b: cedar_policies set, cap unset.
+    mockOnboardedWithConfig({
+      cedar_policies: ['permit (principal, action, resource);'],
+    });
+    const result = await createTaskCore(
+      { repo: 'org/repo', task_description: 'x' },
+      makeContext(),
+      'req-cap-legacy',
+    );
+    expect(result.statusCode).toBe(201);
+    const record = getPersistedTaskRecord();
+    expect(record.approval_gate_cap).toBe(50);
+  });
+
+  test('persists blueprint-configured approval_gate_cap when within bounds', async () => {
+    mockOnboardedWithConfig({ approval_gate_cap: 150 });
+    const result = await createTaskCore(
+      { repo: 'org/repo', task_description: 'x' },
+      makeContext(),
+      'req-cap-override',
+    );
+    expect(result.statusCode).toBe(201);
+    const record = getPersistedTaskRecord();
+    expect(record.approval_gate_cap).toBe(150);
+  });
+
+  test.each([
+    ['min (1)', 1],
+    ['max (500)', 500],
+  ])('accepts blueprint approval_gate_cap at boundary %s', async (_label, cap) => {
+    mockOnboardedWithConfig({ approval_gate_cap: cap });
+    const result = await createTaskCore(
+      { repo: 'org/repo', task_description: 'x' },
+      makeContext(),
+      `req-cap-boundary-${cap}`,
+    );
+    expect(result.statusCode).toBe(201);
+    expect(getPersistedTaskRecord().approval_gate_cap).toBe(cap);
+  });
+
+  test.each([
+    ['zero', 0],
+    ['negative', -1],
+    ['exceeds max', 501],
+    ['exceeds max big', 10000],
+  ])('returns 503 when blueprint approval_gate_cap is %s (out-of-bounds)', async (_label, cap) => {
+    // Blueprint synth validation should catch these, but a hand-edited
+    // RepoConfig row could bypass it. Fail closed so we never persist
+    // a bad cap onto a TaskRecord. 503 SERVICE_UNAVAILABLE (not 500)
+    // because the condition is permanent platform misconfiguration,
+    // not a transient internal error — 500 would misleadingly suggest
+    // retry-will-fix.
+    mockOnboardedWithConfig({ approval_gate_cap: cap });
+    const result = await createTaskCore(
+      { repo: 'org/repo', task_description: 'x' },
+      makeContext(),
+      `req-cap-bad-${cap}`,
+    );
+    expect(result.statusCode).toBe(503);
+    expect(JSON.parse(result.body).error.code).toBe('SERVICE_UNAVAILABLE');
+    expect(JSON.parse(result.body).error.message).toContain('approval_gate_cap');
+  });
+
+  test.each([
+    ['string', '50'],
+    ['float', 3.14],
+    ['object', {}],
+  ])('returns 503 when blueprint approval_gate_cap is non-integer (%s)', async (_label, cap) => {
+    mockOnboardedWithConfig({ approval_gate_cap: cap });
+    const result = await createTaskCore(
+      { repo: 'org/repo', task_description: 'x' },
+      makeContext(),
+      'req-cap-non-int',
+    );
+    expect(result.statusCode).toBe(503);
+    expect(JSON.parse(result.body).error.code).toBe('SERVICE_UNAVAILABLE');
+    expect(JSON.parse(result.body).error.message).toContain('not an integer');
+  });
+
+  test('only performs one RepoTable GetItem on the submit path', async () => {
+    // Regression guard: the submit path previously issued two
+    // back-to-back GetItems on the same key (onboarding gate +
+    // blueprint cap). ``lookupRepo`` collapses them into one.
+    await createTaskCore(
+      { repo: 'org/repo', task_description: 'Fix the bug' },
+      makeContext(),
+      'req-single-get',
+    );
+    expect(mockLookupRepo).toHaveBeenCalledTimes(1);
+    expect(mockLookupRepo).toHaveBeenCalledWith('org/repo');
   });
 });

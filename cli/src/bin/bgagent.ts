@@ -20,13 +20,20 @@
  */
 
 import { Command } from 'commander';
+import { makeAdminCommand } from '../commands/admin';
+import { makeApproveCommand } from '../commands/approve';
 import { makeCancelCommand } from '../commands/cancel';
 import { makeConfigureCommand } from '../commands/configure';
+import { makeDenyCommand } from '../commands/deny';
 import { makeEventsCommand } from '../commands/events';
+import { makeGithubCommand } from '../commands/github';
+import { makeJiraCommand } from '../commands/jira';
 import { makeLinearCommand } from '../commands/linear';
 import { makeListCommand } from '../commands/list';
 import { makeLoginCommand } from '../commands/login';
 import { makeNudgeCommand } from '../commands/nudge';
+import { makePendingCommand } from '../commands/pending';
+import { makePoliciesCommand } from '../commands/policies';
 import { makeSlackCommand } from '../commands/slack';
 import { makeStatusCommand } from '../commands/status';
 import { makeSubmitCommand } from '../commands/submit';
@@ -58,12 +65,19 @@ program.addCommand(makeListCommand());
 program.addCommand(makeStatusCommand());
 program.addCommand(makeCancelCommand());
 program.addCommand(makeNudgeCommand());
+program.addCommand(makeApproveCommand());
+program.addCommand(makeDenyCommand());
+program.addCommand(makePendingCommand());
+program.addCommand(makePoliciesCommand());
 program.addCommand(makeEventsCommand());
 program.addCommand(makeSlackCommand());
 program.addCommand(makeLinearCommand());
+program.addCommand(makeJiraCommand());
+program.addCommand(makeGithubCommand());
 program.addCommand(makeWatchCommand());
 program.addCommand(makeTraceCommand());
 program.addCommand(makeWebhookCommand());
+program.addCommand(makeAdminCommand());
 
 // Execute the CLI only when run directly. Importing this module (e.g.
 // from a test harness or a wrapper) must not parse the importer's
@@ -83,7 +97,9 @@ if (require.main === module) {
       } else {
         console.error('An unexpected error occurred.');
       }
-      process.exitCode = 1;
+      // CliError carries a per-failure-class exit code (e.g. 2 for
+      // wait-timeout) so scripts can branch on it; everything else is 1.
+      process.exitCode = err instanceof CliError ? err.exitCode : 1;
     })
     .finally(() => {
       // Node's global ``fetch`` (undici) keeps TCP sockets alive in a
@@ -99,8 +115,9 @@ if (require.main === module) {
       // keep-alive timeout. Observed in Scenarios 6 and 7-extended
       // deploy validation where ``bgagent watch`` had to be ``pkill``-ed
       // after the task reached COMPLETED.
+      const EXIT_FLUSH_DELAY_MS = 50;
       setTimeout(() => {
         process.exit(process.exitCode ?? 0);
-      }, 50).unref();
+      }, EXIT_FLUSH_DELAY_MS).unref();
     });
 }

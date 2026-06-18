@@ -24,6 +24,7 @@ import { createTaskCore } from './shared/create-task-core';
 import { logger } from './shared/logger';
 import { slackFetch } from './shared/slack-api';
 import { getSlackSecret, SLACK_SECRET_PREFIX } from './shared/slack-verify';
+import type { Attachment } from './shared/types';
 import type { SlackCommandPayload } from './slack-commands';
 
 /**
@@ -42,10 +43,20 @@ export interface SlashCommandEvent extends BasePayload, SlackCommandPayload {
   readonly source: 'slash';
 }
 
+/** Metadata for a file attached to a Slack message. */
+export interface SlackFileRef {
+  readonly id: string;
+  readonly name: string;
+  readonly mimetype: string;
+  readonly size: number;
+  readonly url_private_download: string;
+}
+
 /** @mention invocation — no response_url; reply via chat.postMessage in-thread. */
 export interface MentionEvent extends BasePayload {
   readonly source: 'mention';
   readonly mention_thread_ts?: string;
+  readonly files?: readonly SlackFileRef[];
 }
 
 /** Discriminated union of the inbound events the processor accepts. */
@@ -72,6 +83,12 @@ const INSTALLATION_TABLE = process.env.SLACK_INSTALLATION_TABLE_NAME!;
 
 /** Link code TTL. */
 const LINK_CODE_TTL_S = 10 * 60; // 10 minutes
+
+/** Random bytes for slash-command account-link codes (→ 6 hex chars). */
+const LINK_CODE_ENTROPY_BYTES = 3;
+
+/** Prefix length when logging Slack response_url values (avoid leaking tokens). */
+const RESPONSE_URL_LOG_PREFIX_LEN = 80;
 
 /**
  * Async processor for Slack slash commands and @mention triggers.
@@ -209,12 +226,24 @@ async function handleSubmit(event: MentionEvent, args: string[], reply: ReplyFn)
     channelMetadata.slack_thread_ts = event.mention_thread_ts;
   }
 
+  // Extract file attachments from the Slack event (if present).
+  // Files are downloaded from Slack CDN and passed as inline base64 attachments.
+  const attachments = await extractSlackFileAttachments(event, reply);
+  if (attachments === null) {
+    // extractSlackFileAttachments already replied with the error
+    if (event.mention_thread_ts) {
+      await swapReaction(event.team_id, event.channel_id, event.mention_thread_ts, 'eyes', 'x');
+    }
+    return;
+  }
+
   // Create the task through the shared core.
   const result = await createTaskCore(
     {
       repo,
       issue_number: issueNumber,
       task_description: description,
+      ...(attachments.length > 0 && { attachments }),
     },
     {
       userId: platformUserId,
@@ -254,7 +283,7 @@ function parseRepoArg(arg: string): { repo: string | null; issueNumber?: number 
 
 async function handleLink(event: CommandProcessorEvent, reply: ReplyFn): Promise<void> {
   // Generate a 6-character alphanumeric code.
-  const code = crypto.randomBytes(3).toString('hex').toUpperCase();
+  const code = crypto.randomBytes(LINK_CODE_ENTROPY_BYTES).toString('hex').toUpperCase();
   const now = new Date().toISOString();
   const ttl = Math.floor(Date.now() / 1000) + LINK_CODE_TTL_S;
 
@@ -345,6 +374,132 @@ async function checkChannelAccess(teamId: string, channelId: string): Promise<{ 
   }
 }
 
+// ─── Slack File Extraction ───────────────────────────────────────────────────
+
+/** Max size for a Slack file attachment (10 MB per the design doc). */
+const SLACK_FILE_MAX_SIZE_BYTES = 10 * 1024 * 1024;
+/** Max number of file attachments per Slack message. */
+const SLACK_FILE_MAX_COUNT = 10;
+
+/** MIME types supported for attachments (must match validation.ts — PNG/JPEG only). */
+const SUPPORTED_IMAGE_MIMES = new Set(['image/png', 'image/jpeg']);
+const SUPPORTED_FILE_MIMES = new Set([
+  'text/plain', 'text/csv', 'text/markdown', 'application/json',
+  'application/pdf', 'text/x-log',
+]);
+
+/**
+ * Download Slack file attachments and convert them to inline Attachment objects.
+ * Returns null if validation fails (reply already sent). Returns an empty array
+ * if no files are attached.
+ *
+ * Implements atomic failure semantics: if ANY file fails validation or download,
+ * the entire submission is rejected with a descriptive error listing all failures.
+ */
+async function extractSlackFileAttachments(
+  event: MentionEvent,
+  reply: ReplyFn,
+): Promise<Attachment[] | null> {
+  const files = event.files;
+  if (!files || files.length === 0) return [];
+
+  if (files.length > SLACK_FILE_MAX_COUNT) {
+    await reply(`:x: Task not created. Too many attachments (${files.length}, max ${SLACK_FILE_MAX_COUNT}).`);
+    return null;
+  }
+
+  const errors: string[] = [];
+  const attachments: Attachment[] = [];
+
+  const botToken = await getBotToken(event.team_id);
+  if (!botToken) {
+    await reply(':x: Task not created. Cannot download attachments (bot token not found).');
+    return null;
+  }
+
+  for (const file of files) {
+    // Validate size
+    if (file.size > SLACK_FILE_MAX_SIZE_BYTES) {
+      const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+      errors.push(`\`${file.name}\` (too large, ${sizeMb} MB > 10 MB limit)`);
+      continue;
+    }
+
+    // Validate MIME type
+    const mime = file.mimetype.toLowerCase();
+    const isImage = SUPPORTED_IMAGE_MIMES.has(mime);
+    const isFile = SUPPORTED_FILE_MIMES.has(mime);
+    if (!isImage && !isFile) {
+      errors.push(`\`${file.name}\` has unsupported type \`${mime}\``);
+      continue;
+    }
+
+    // Validate the download URL points to a legitimate Slack domain before
+    // sending the bot token — prevents SSRF and token exfiltration via crafted events.
+    if (!isSlackFileUrl(file.url_private_download)) {
+      errors.push(`\`${file.name}\` (invalid download URL — not a Slack domain)`);
+      continue;
+    }
+
+    // Download the file from Slack CDN using the bot token
+    try {
+      const response = await fetch(file.url_private_download, {
+        headers: { Authorization: `Bearer ${botToken}` },
+      });
+
+      if (!response.ok) {
+        errors.push(`\`${file.name}\` (download failed: HTTP ${response.status})`);
+        continue;
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+
+      // Post-download size validation: Slack's declared file.size may differ
+      // from the actual download (e.g., server-side processing, bug, or manipulation).
+      if (buffer.length > SLACK_FILE_MAX_SIZE_BYTES) {
+        const sizeMb = (buffer.length / (1024 * 1024)).toFixed(1);
+        errors.push(`\`${file.name}\` (downloaded size ${sizeMb} MB exceeds 10 MB limit)`);
+        continue;
+      }
+
+      attachments.push({
+        type: isImage ? 'image' : 'file',
+        content_type: mime,
+        filename: file.name,
+        data: buffer.toString('base64'),
+      });
+    } catch (err) {
+      logger.error('Failed to download Slack file', {
+        filename: file.name,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      errors.push(`\`${file.name}\` (download failed)`);
+    }
+  }
+
+  // Atomic failure: if any file failed, reject the entire submission
+  if (errors.length > 0) {
+    const errorList = errors.length === 1
+      ? errors[0]
+      : `${errors.length} attachment errors: ${errors.join(', ')}`;
+    await reply(`:x: Task not created. ${errorList}. Fix or remove these files and try again.`);
+    return null;
+  }
+
+  return attachments;
+}
+
+/** Validate that a URL points to a legitimate Slack file domain. */
+function isSlackFileUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:'
+      && (parsed.hostname === 'files.slack.com' || parsed.hostname.endsWith('.slack.com'));
+  } catch {
+    return false;
+  }
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function lookupPlatformUser(teamId: string, userId: string): Promise<string | null> {
@@ -369,7 +524,7 @@ async function lookupPlatformUser(teamId: string, userId: string): Promise<strin
 
 async function postToSlack(responseUrl: string, text: string): Promise<void> {
   logger.info('Posting to Slack response_url', {
-    response_url: responseUrl.substring(0, 80),
+    response_url: responseUrl.substring(0, RESPONSE_URL_LOG_PREFIX_LEN),
     text_length: text.length,
   });
   try {
@@ -382,7 +537,7 @@ async function postToSlack(responseUrl: string, text: string): Promise<void> {
       const body = await response.text().catch(() => '');
       logger.warn('Failed to post to Slack response_url', {
         status: response.status,
-        response_url: responseUrl.substring(0, 80),
+        response_url: responseUrl.substring(0, RESPONSE_URL_LOG_PREFIX_LEN),
         body,
       });
     } else {

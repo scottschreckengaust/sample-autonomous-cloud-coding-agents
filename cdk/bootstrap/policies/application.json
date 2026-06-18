@@ -1,0 +1,221 @@
+{
+  "Statement": [
+    {
+      "Action": [
+        "dynamodb:CreateTable",
+        "dynamodb:DeleteTable",
+        "dynamodb:DescribeTable",
+        "dynamodb:DescribeTimeToLive",
+        "dynamodb:UpdateTimeToLive",
+        "dynamodb:UpdateTable",
+        "dynamodb:UpdateContinuousBackups",
+        "dynamodb:DescribeContinuousBackups",
+        "dynamodb:TagResource",
+        "dynamodb:UntagResource",
+        "dynamodb:ListTagsOfResource",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DescribeContributorInsights",
+        "dynamodb:DescribeKinesisStreamingDestination",
+        "dynamodb:GetResourcePolicy"
+      ],
+      "Effect": "Allow",
+      "Resource": "arn:aws:dynamodb:*:*:table/backgroundagent-dev-*",
+      "Sid": "DynamoDB"
+    },
+    {
+      "Action": [
+        "lambda:CreateFunction",
+        "lambda:DeleteFunction",
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:AddPermission",
+        "lambda:RemovePermission",
+        "lambda:GetPolicy",
+        "lambda:TagResource",
+        "lambda:UntagResource",
+        "lambda:ListTags",
+        "lambda:PublishVersion",
+        "lambda:CreateAlias",
+        "lambda:DeleteAlias",
+        "lambda:GetAlias",
+        "lambda:UpdateAlias",
+        "lambda:PutFunctionEventInvokeConfig",
+        "lambda:DeleteFunctionEventInvokeConfig",
+        "lambda:GetFunctionEventInvokeConfig",
+        "lambda:PutFunctionConcurrency",
+        "lambda:DeleteFunctionConcurrency",
+        "lambda:GetFunctionCodeSigningConfig",
+        "lambda:GetFunctionRecursionConfig",
+        "lambda:GetProvisionedConcurrencyConfig",
+        "lambda:GetRuntimeManagementConfig",
+        "lambda:ListVersionsByFunction",
+        "lambda:InvokeFunction",
+        "lambda:PublishLayerVersion",
+        "lambda:DeleteLayerVersion",
+        "lambda:GetLayerVersion"
+      ],
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:lambda:*:*:function:backgroundagent-dev-*",
+        "arn:aws:lambda:*:*:function:backgroundagent-dev-AWS*",
+        "arn:aws:lambda:*:*:layer:*"
+      ],
+      "Sid": "Lambda"
+    },
+    {
+      "Action": [
+        "lambda:CreateEventSourceMapping",
+        "lambda:DeleteEventSourceMapping",
+        "lambda:UpdateEventSourceMapping",
+        "lambda:GetEventSourceMapping"
+      ],
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "LambdaEventSourceMappings"
+    },
+    {
+      "Action": [
+        "apigateway:POST",
+        "apigateway:GET",
+        "apigateway:PUT",
+        "apigateway:PATCH",
+        "apigateway:DELETE",
+        "apigateway:TagResource",
+        "apigateway:UntagResource",
+        "apigateway:SetWebACL",
+        "apigateway:UpdateRestApiPolicy"
+      ],
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:apigateway:*::/restapis",
+        "arn:aws:apigateway:*::/restapis/*",
+        "arn:aws:apigateway:*::/account",
+        "arn:aws:apigateway:*::/tags/*"
+      ],
+      "Sid": "APIGateway"
+    },
+    {
+      "Action": [
+        "cognito-idp:CreateUserPool",
+        "cognito-idp:DeleteUserPool",
+        "cognito-idp:DescribeUserPool",
+        "cognito-idp:UpdateUserPool",
+        "cognito-idp:CreateUserPoolClient",
+        "cognito-idp:DeleteUserPoolClient",
+        "cognito-idp:DescribeUserPoolClient",
+        "cognito-idp:UpdateUserPoolClient",
+        "cognito-idp:TagResource",
+        "cognito-idp:UntagResource",
+        "cognito-idp:ListTagsForResource",
+        "cognito-idp:GetUserPoolMfaConfig"
+      ],
+      "Effect": "Allow",
+      "Resource": "arn:aws:cognito-idp:*:*:userpool/*",
+      "Sid": "Cognito"
+    },
+    {
+      "Action": [
+        "wafv2:CreateWebACL",
+        "wafv2:DeleteWebACL",
+        "wafv2:GetWebACL",
+        "wafv2:UpdateWebACL",
+        "wafv2:AssociateWebACL",
+        "wafv2:DisassociateWebACL",
+        "wafv2:ListTagsForResource",
+        "wafv2:TagResource",
+        "wafv2:UntagResource",
+        "wafv2:GetWebACLForResource"
+      ],
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:wafv2:*:*:regional/webacl/*",
+        "arn:aws:wafv2:*:*:regional/managedruleset/*"
+      ],
+      "Sid": "WAFv2"
+    },
+    {
+      "Action": [
+        "events:PutRule",
+        "events:DeleteRule",
+        "events:DescribeRule",
+        "events:PutTargets",
+        "events:RemoveTargets",
+        "events:ListTargetsByRule",
+        "events:TagResource",
+        "events:UntagResource",
+        "events:ListTagsForResource"
+      ],
+      "Effect": "Allow",
+      "Resource": "arn:aws:events:*:*:rule/backgroundagent-dev-*",
+      "Sid": "EventBridge"
+    },
+    {
+      "Action": [
+        "sqs:CreateQueue",
+        "sqs:DeleteQueue",
+        "sqs:GetQueueAttributes",
+        "sqs:SetQueueAttributes",
+        "sqs:TagQueue",
+        "sqs:UntagQueue",
+        "sqs:GetQueueUrl",
+        "sqs:ListQueueTags"
+      ],
+      "Effect": "Allow",
+      "Resource": "arn:aws:sqs:*:*:backgroundagent-dev-*",
+      "Sid": "SQS"
+    },
+    {
+      "Action": [
+        "cloudfront:CreateDistribution",
+        "cloudfront:UpdateDistribution",
+        "cloudfront:DeleteDistribution",
+        "cloudfront:GetDistribution",
+        "cloudfront:TagResource",
+        "cloudfront:UntagResource",
+        "cloudfront:ListTagsForResource",
+        "cloudfront:CreateOriginAccessControl",
+        "cloudfront:UpdateOriginAccessControl",
+        "cloudfront:DeleteOriginAccessControl",
+        "cloudfront:GetOriginAccessControl"
+      ],
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "CloudFront"
+    },
+    {
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:DeleteSecret",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:UpdateSecret",
+        "secretsmanager:TagResource",
+        "secretsmanager:UntagResource",
+        "secretsmanager:GetResourcePolicy",
+        "secretsmanager:PutResourcePolicy",
+        "secretsmanager:DeleteResourcePolicy"
+      ],
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:secretsmanager:*:*:secret:backgroundagent-*",
+        "arn:aws:secretsmanager:*:*:secret:GitHubTokenSecret*",
+        "arn:aws:secretsmanager:*:*:secret:SlackIntegration*",
+        "arn:aws:secretsmanager:*:*:secret:LinearIntegration*",
+        "arn:aws:secretsmanager:*:*:secret:GitHubScreenshot*",
+        "arn:aws:secretsmanager:*:*:secret:bgagent/*"
+      ],
+      "Sid": "SecretsManager"
+    },
+    {
+      "Action": "secretsmanager:GetRandomPassword",
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "SecretsManagerAccountLevel"
+    }
+  ],
+  "Version": "2012-10-17"
+}

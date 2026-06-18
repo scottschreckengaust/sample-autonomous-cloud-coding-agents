@@ -42,13 +42,13 @@ jobs:
       AQUA_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Install mise
-        uses: jdx/mise-action@1648a7812b9aeae629881980618f079932869151 # v4.0.1
+        uses: jdx/mise-action@dba19683ed58901619b14f395a24841710cb4925 # v4.1.0
         with:
           cache: true
 
@@ -62,7 +62,9 @@ jobs:
 
       - name: Run security suite
         id: scan
-        run: mise run security 2>&1 | tee security-log.txt
+        run: |
+          set -o pipefail
+          mise run security 2>&1 | tee security-log.txt
         continue-on-error: true
 
       - name: Open issue on failure
@@ -95,6 +97,7 @@ jobs:
 
           gh issue create \
             --title "Security suite failed (${GITHUB_REF_NAME} @ ${short})" \
+            --label bug \
             --body-file "${body_file}"
 
       - name: Fail job if security suite failed

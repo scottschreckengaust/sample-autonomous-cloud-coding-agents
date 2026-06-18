@@ -3,6 +3,13 @@ min_version = "2026.2.6"
 [tools]
 node = "22"
 
+# CDK synth and Jest tests write large cdk.out artifacts to TMPDIR.
+# Default /tmp is often tmpfs with limited space; redirect to disk-backed dir.
+# Path MUST be outside the repo tree — CDK asset fingerprinting walks TMPDIR
+# recursively and would loop if .tmp/ were inside the bundled directory.
+[env]
+TMPDIR = "{{env.HOME}}/.cache/cdk-tmp"
+
 [tasks.install]
 description = "Install dependencies from repo root (Yarn workspaces)"
 run = "cd .. && yarn install --check-files"
@@ -17,24 +24,31 @@ run = "yarn eslint"
 
 [tasks.test]
 description = "Jest tests"
-run = "yarn test"
+depends = [":compile"]
+run = ["mkdir -p $TMPDIR", "yarn test"]
 
 [tasks.synth]
 description = "cdk synth"
-run = "yarn synth"
+run = ["mkdir -p $TMPDIR", "yarn synth"]
 
 [tasks."synth:quiet"]
 description = "cdk synth (quiet)"
-run = "yarn synth:quiet"
+depends = [":compile"]
+run = ["mkdir -p $TMPDIR", "yarn synth:quiet"]
 
 [tasks.deploy]
 description = "cdk deploy (pass args after --)"
 run = "npx cdk deploy"
 
 [tasks.bootstrap]
-description = "Bootstrap CDK in the current AWS account/region (one-time)"
+description = "Bootstrap CDK with least-privilege policies (pass -- --context ComputeTypes=agentcore,ecs for ECS)"
+depends = [":install", ":bootstrap:generate"]
+run = "npx cdk bootstrap --template bootstrap/bootstrap-template.yaml"
+
+[tasks."bootstrap:generate"]
+description = "Regenerate all bootstrap artifacts (policies JSON, template YAML, version/hash files)"
 depends = [":install"]
-run = "npx cdk bootstrap"
+run = "npx tsx scripts/generate-bootstrap-artifacts.ts && npx tsx scripts/generate-bootstrap-template.ts"
 
 [tasks.destroy]
 description = "cdk destroy"
@@ -44,10 +58,21 @@ run = "npx cdk destroy"
 description = "cdk diff"
 run = "npx cdk diff"
 
+[tasks.integ]
+description = "CDK deploy-then-verify integration tests (integ-runner). Needs AWS creds for the shared integ account."
+depends = [":compile"]
+run = [
+  "mkdir -p $TMPDIR",
+  # No --update-on-failed: .snapshot/ is gitignored, so there is no committed
+  # snapshot to diff against or update. --force re-runs the deploy-then-verify
+  # unconditionally, which is what we want in CI.
+  "npx integ-runner --language typescript --directory test/integ --force",
+]
+
 [tasks.bundle]
 description = "No-op bundle step for cdk/cdk.json (NodejsFunction bundles at synth time)"
 run = "node -e \"process.exit(0)\""
 
 [tasks.build]
-description = "compile, test, eslint, synth (quiet)"
-depends = [":compile", ":test", ":eslint", ":synth:quiet"]
+description = "compile, test, eslint, synth (quiet) — DAG: compile first, then test+synth+eslint in parallel"
+depends = [":test", ":eslint", ":synth:quiet"]

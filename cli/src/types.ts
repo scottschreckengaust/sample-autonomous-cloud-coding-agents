@@ -17,8 +17,39 @@
  *  SOFTWARE.
  */
 
-/** Valid task types for task creation. */
-export type TaskType = 'new_task' | 'pr_iteration' | 'pr_review';
+/**
+ * A resolved workflow pin: the ``{id, version}`` produced at the create-task
+ * boundary from a ``workflow_ref`` (or the resolution fallback). Replaces the
+ * former ``task_type`` enum end-to-end (#248).
+ *
+ * Mirrors ``cdk/src/handlers/shared/types.ts::ResolvedWorkflow`` per the CLI
+ * types-sync contract.
+ */
+export type ResolvedWorkflow = {
+  readonly id: string;
+  readonly version: string;
+};
+
+/** Shared across all attachment interfaces. Add new types here (e.g., 'audio'). */
+export type AttachmentType = 'image' | 'file' | 'url';
+
+/**
+ * Task status literal union. Mirrors ``cdk/src/constructs/task-status.ts``
+ * — the values returned by the API are exactly these. Defined inline
+ * here (rather than imported from the CDK construct) so the CLI type
+ * surface stays portable.
+ */
+export type TaskStatusType =
+  | 'PENDING_UPLOADS'
+  | 'SUBMITTED'
+  | 'HYDRATING'
+  | 'RUNNING'
+  | 'AWAITING_APPROVAL'
+  | 'FINALIZING'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'CANCELLED'
+  | 'TIMED_OUT';
 
 /**
  * Provenance of a task's submission. Shared across inbound adapters:
@@ -26,12 +57,13 @@ export type TaskType = 'new_task' | 'pr_iteration' | 'pr_review';
  * - ``webhook``: HMAC-signed inbound webhook submissions (generic webhook endpoint)
  * - ``slack``: Slack @mention / slash-command submissions
  * - ``linear``: Linear label-triggered submissions
+ * - ``jira``: Jira Cloud label-triggered submissions
  *
  * Mirrors ``cdk/src/handlers/shared/types.ts::ChannelSource`` per the CLI
  * types-sync contract so downstream switches/predicates get exhaustiveness
  * checking on both sides of the wire.
  */
-export type ChannelSource = 'api' | 'webhook' | 'slack' | 'linear';
+export type ChannelSource = 'api' | 'webhook' | 'slack' | 'linear' | 'jira';
 
 /** Error categories produced by the runtime error classifier. */
 export type ErrorCategoryType = 'auth' | 'network' | 'concurrency' | 'compute' | 'agent' | 'guardrail' | 'config' | 'timeout' | 'unknown';
@@ -48,10 +80,11 @@ export interface ErrorClassification {
 /** Task detail returned by GET /v1/tasks/{task_id}. */
 export interface TaskDetail {
   readonly task_id: string;
-  readonly status: string;
-  readonly repo: string;
+  readonly status: TaskStatusType;
+  /** ``null`` for a repo-less workflow (#248 Phase 3). */
+  readonly repo: string | null;
   readonly issue_number: number | null;
-  readonly task_type: TaskType;
+  readonly resolved_workflow: ResolvedWorkflow | null;
   readonly pr_number: number | null;
   readonly task_description: string | null;
   readonly branch_name: string;
@@ -59,6 +92,10 @@ export interface TaskDetail {
   readonly pr_url: string | null;
   readonly error_message: string | null;
   readonly error_classification: ErrorClassification | null;
+  /** Prompt-template version applied during context hydration. Null on
+   *  pre-versioned records. Mirrors
+   *  ``cdk/src/handlers/shared/types.ts::TaskDetail``. */
+  readonly prompt_version: string | null;
   /** Provenance of the task's submission — ``api`` for CLI / Cognito
    *  submissions, ``webhook`` for HMAC-signed inbound webhooks.
    *  Mirrors ``cdk/src/handlers/shared/types.ts::TaskDetail``; kept
@@ -96,6 +133,19 @@ export interface TaskDetail {
    *  the URI in ``status --output json`` lets users / scripts detect
    *  completion without an extra round trip. */
   readonly trace_s3_uri: string | null;
+  /** S3 URI of a repo-less delivered artifact (#248 Phase 3); ``null`` otherwise. */
+  readonly artifact_uri: string | null;
+  readonly attachments: AttachmentSummary[] | null;
+  /** Cedar HITL: running counter of approval gates fired on this
+   *  task. Null only on pre-Cedar-HITL records. */
+  readonly approval_gate_count: number | null;
+  /** Cedar HITL: per-task cap on total approval gates, captured at
+   *  submit time from the blueprint (default 50). Null only on
+   *  pre-Cedar-HITL records. */
+  readonly approval_gate_cap: number | null;
+  /** Cedar HITL: when ``status = AWAITING_APPROVAL``, the
+   *  ``request_id`` of the pending approval row. Null otherwise. */
+  readonly awaiting_approval_request_id: string | null;
 }
 
 /** Response body of ``GET /v1/tasks/{task_id}/trace`` (design §10.1). */
@@ -109,10 +159,11 @@ export interface TraceUrlResponse {
 /** Task summary returned by GET /v1/tasks list responses. */
 export interface TaskSummary {
   readonly task_id: string;
-  readonly status: string;
-  readonly repo: string;
+  readonly status: TaskStatusType;
+  /** ``null`` for a repo-less workflow (#248 Phase 3). */
+  readonly repo: string | null;
   readonly issue_number: number | null;
-  readonly task_type: TaskType;
+  readonly resolved_workflow: ResolvedWorkflow | null;
   readonly pr_number: number | null;
   readonly task_description: string | null;
   readonly branch_name: string;
@@ -148,15 +199,54 @@ export interface GetTaskEventsQuery {
   readonly desc?: string;
 }
 
+/** Wire format — parsed from untrusted JSON. Validate before use. */
+export interface Attachment {
+  readonly type: AttachmentType;
+  readonly content_type?: string;
+  readonly data?: string;
+  readonly url?: string;
+  readonly filename?: string;
+  readonly expected_size_bytes?: number;
+}
+
+/** Attachment metadata in task detail responses. */
+export interface AttachmentSummary {
+  readonly attachment_id: string;
+  readonly type: AttachmentType;
+  readonly filename: string;
+  readonly content_type: string;
+  readonly size_bytes: number;
+  readonly screening_status: 'passed' | 'blocked' | 'pending';
+}
+
+/** Presigned upload instruction returned on PENDING_UPLOADS creation. */
+export interface AttachmentUploadInstruction {
+  readonly attachment_id: string;
+  readonly filename: string;
+  readonly upload_url: string;
+  readonly upload_fields: Record<string, string>;
+  readonly upload_expires_at: string;
+}
+
+/** Response from POST /v1/tasks when presigned uploads are required. */
+export interface CreateTaskResponse extends TaskDetail {
+  readonly upload_instructions?: readonly AttachmentUploadInstruction[];
+  readonly task_expires_at?: string;
+}
+
 /** Create task request body for POST /v1/tasks. */
 export interface CreateTaskRequest {
-  readonly repo: string;
+  /** Optional since #248 Phase 3: repo-less workflows submit without it. */
+  readonly repo?: string;
   readonly issue_number?: number;
   readonly task_description?: string;
   readonly max_turns?: number;
   readonly max_budget_usd?: number;
-  readonly task_type?: TaskType;
+  /** Workflow selector ``<id>[@<constraint>]``. Replaces ``task_type`` (#248).
+   *  Omitted ⇒ the create-task boundary resolves via the fallback ladder. */
+  readonly workflow_ref?: string;
   readonly pr_number?: number;
+  readonly attachments?: readonly Attachment[];
   /**
    * Enable the ``--trace`` debug path (design §10.1). When true, the
    * agent's ProgressWriter raises its preview-truncation cap from 200
@@ -165,6 +255,12 @@ export interface CreateTaskRequest {
    * ``bgagent watch`` / notifications.
    */
   readonly trace?: boolean;
+  /** Cedar HITL per-task default approval timeout (design §7.3 step 5).
+   *  Valid range ``[APPROVAL_TIMEOUT_S_MIN, APPROVAL_TIMEOUT_S_MAX]``. */
+  readonly approval_timeout_s?: number;
+  /** Cedar HITL pre-approval allowlist seeded at task start (§7.3 step 4).
+   *  Each entry must be a valid ``ApprovalScope``. */
+  readonly initial_approvals?: readonly ApprovalScope[];
 }
 
 /**
@@ -196,7 +292,7 @@ export interface NudgeResponse {
 /** Cancel task response from DELETE /v1/tasks/{task_id}. */
 export interface CancelTaskResponse {
   readonly task_id: string;
-  readonly status: string;
+  readonly status: TaskStatusType;
   readonly cancelled_at: string;
 }
 
@@ -256,11 +352,35 @@ export interface SlackLinkResponse {
   readonly linked_at: string;
 }
 
-/** Linear link response from POST /v1/linear/link. */
+/** Linear link response from POST /v1/linear/link.
+ *
+ * `dry_run: true` returns the identity attached to the code without
+ * writing the mapping. CLI uses it to preview before the user confirms.
+ * `linked_at` is omitted from the dry-run response. */
 export interface LinearLinkResponse {
+  readonly dry_run?: boolean;
   readonly linear_workspace_id: string;
+  readonly linear_workspace_slug?: string;
   readonly linear_user_id: string;
-  readonly linked_at: string;
+  readonly linear_user_name?: string;
+  readonly linear_user_email?: string;
+  readonly linked_at?: string;
+}
+
+/** Jira link response from POST /v1/jira/link.
+ *
+ * Mirrors LinearLinkResponse semantics: `dry_run: true` returns the
+ * identity attached to the code without writing. The CLI uses dry-run
+ * to render a preview before the user confirms. `linked_at` is omitted
+ * from the dry-run response. */
+export interface JiraLinkResponse {
+  readonly dry_run?: boolean;
+  readonly jira_cloud_id: string;
+  readonly jira_site_url?: string;
+  readonly jira_account_id: string;
+  readonly jira_user_name?: string;
+  readonly jira_user_email?: string;
+  readonly linked_at?: string;
 }
 
 /** CLI config stored in ~/.bgagent/config.json. */
@@ -285,3 +405,144 @@ export interface Credentials {
 
 /** Terminal task statuses. */
 export const TERMINAL_STATUSES = ['COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT'] as const;
+
+/**
+ * Default coding workflow id. A bare ``bgagent submit --repo X --task Y``
+ * (no ``--workflow``/``--pr``/``--review-pr``) maps to this workflow — the
+ * old ``new_task`` default that clones, builds, and opens a PR. Also used by
+ * the formatters to suppress a redundant "Workflow:" line when the resolved
+ * workflow is just the default. Hoisted to a single constant so the literal
+ * is not duplicated across ``submit.ts`` and ``format.ts``.
+ */
+export const DEFAULT_CODING_WORKFLOW_ID = 'coding/new-task-v1';
+
+// ---------------------------------------------------------------------------
+// Cedar HITL approval types — mirrored from
+// ``cdk/src/handlers/shared/types.ts`` per the CLI types-sync contract.
+// ---------------------------------------------------------------------------
+
+/** Approval scope — matches the `ApprovalScope` discriminated-union on
+ *  the server side. Narrowed so `bgagent approve --scope ...` gets
+ *  exhaustive type-checking on the CLI side. */
+export type ApprovalScope =
+  | 'this_call'
+  | 'tool_type_session'
+  | 'tool_group_session'
+  | 'all_session'
+  | `tool_type:${string}`
+  | `tool_group:${string}`
+  | `bash_pattern:${string}`
+  | `write_path:${string}`
+  | `rule:${string}`;
+
+/** Approval row terminal / pending status. */
+export type ApprovalStatus =
+  | 'PENDING'
+  | 'APPROVED'
+  | 'DENIED'
+  | 'TIMED_OUT'
+  | 'STRANDED';
+
+/** POST /v1/tasks/{task_id}/approve request body. */
+export interface ApprovalRequest {
+  readonly request_id: string;
+  readonly decision: 'approve';
+  readonly scope?: ApprovalScope;
+}
+
+/** POST /v1/tasks/{task_id}/approve response body. */
+export interface ApprovalResponse {
+  readonly task_id: string;
+  readonly request_id: string;
+  readonly status: 'APPROVED';
+  readonly scope: ApprovalScope;
+  readonly decided_at: string;
+}
+
+/** POST /v1/tasks/{task_id}/deny request body. */
+export interface DenyRequest {
+  readonly request_id: string;
+  readonly decision: 'deny';
+  readonly reason?: string;
+}
+
+/** POST /v1/tasks/{task_id}/deny response body. */
+export interface DenyResponse {
+  readonly task_id: string;
+  readonly request_id: string;
+  readonly status: 'DENIED';
+  readonly decided_at: string;
+}
+
+/**
+ * Cedar HITL severity literal. Mirrors
+ * ``cdk/src/handlers/shared/types.ts::Severity``. Shared alias so
+ * the same union is not redefined inline across types.
+ */
+export type Severity = 'low' | 'medium' | 'high';
+
+/** Pending approval summary returned by `GET /v1/pending`. */
+export interface PendingApprovalSummary {
+  readonly task_id: string;
+  readonly request_id: string;
+  readonly tool_name: string;
+  readonly tool_input_preview: string;
+  readonly severity: Severity;
+  readonly reason: string;
+  readonly created_at: string;
+  readonly timeout_s: number;
+  readonly expires_at: string;
+  /** Cedar rule ids that matched this request — shown by
+   *  ``bgagent pending`` so users can see which rule fired without
+   *  spelunking TaskEventsTable. */
+  readonly matching_rule_ids: readonly string[];
+}
+
+/** GET /v1/pending response body. */
+export interface GetPendingResponse {
+  readonly pending: readonly PendingApprovalSummary[];
+}
+
+/** Rule metadata returned by `GET /v1/repos/{repo_id}/policies`. */
+export interface PolicyRuleSummary {
+  readonly rule_id: string;
+  readonly category?: string;
+  readonly severity?: Severity;
+  readonly approval_timeout_s?: number;
+  readonly summary: string;
+}
+
+/** GET /v1/repos/{repo_id}/policies response body. */
+export interface GetPoliciesResponse {
+  readonly repo_id: string;
+  readonly policies: {
+    readonly hard: readonly PolicyRuleSummary[];
+    readonly soft: readonly PolicyRuleSummary[];
+  };
+}
+
+/** Maximum deny reason length after server-side sanitization. */
+export const DENY_REASON_MAX_LENGTH = 2000;
+
+/** Maximum initial_approvals entries on POST /v1/tasks. */
+export const INITIAL_APPROVALS_MAX_ENTRIES = 20;
+
+/** Maximum per-entry length for an initial_approvals scope string. */
+export const INITIAL_APPROVALS_MAX_ENTRY_LENGTH = 128;
+
+/** Lower bound on approval_timeout_s submission. */
+export const APPROVAL_TIMEOUT_S_MIN = 30;
+
+/** Upper bound on approval_timeout_s submission (before maxLifetime clip). */
+export const APPROVAL_TIMEOUT_S_MAX = 3600;
+
+/** Default approval_timeout_s when the submit payload omits it. */
+export const APPROVAL_TIMEOUT_S_DEFAULT = 300;
+
+/** Minimum allowed max_budget_usd (1 cent).
+ *  Sourced from ``contracts/constants.json`` via cdk types.ts (#258). */
+export const MAX_BUDGET_USD_MIN = 0.01;
+
+/** Maximum allowed max_budget_usd ($100).
+ *  Sourced from ``contracts/constants.json`` via cdk types.ts (#258). */
+export const MAX_BUDGET_USD_MAX = 100;

@@ -41,7 +41,7 @@ Permission requirements vary by task type:
 - `new_task` and `pr_iteration` require Contents (read/write) and Pull requests (read/write).
 - `pr_review` only needs Triage or higher since it does not push branches.
 
-Classic PATs with `repo` scope also work. See `agent/README.md` for edge cases.
+Classic PATs with `repo` + `read:org` scopes also work and are required when fine-grained tokens cannot reach the target repo (collaborator access, cross-org repos). See [agent/README.md](../../agent/README.md#github-pat--minimal-permissions) for when to use which token type.
 
 ### Quick setup (single repo)
 
@@ -62,19 +62,42 @@ The default is `awslabs/agent-plugins`. For a quick end-to-end test, fork that r
 To onboard additional repositories, add more `Blueprint` constructs in `cdk/src/stacks/agent.ts` and append them to the `blueprints` array (used to aggregate DNS egress allowlists):
 
 ```typescript
-new Blueprint(this, ‘MyServiceBlueprint’, {
-  repo: ‘acme/my-service’,
+new Blueprint(this, 'MyServiceBlueprint', {
+  repo: 'acme/my-service',
   repoTable: repoTable.table,
 });
 ```
 
-Each Blueprint supports per-repo overrides: `runtimeArn`, `modelId`, `maxTurns`, `systemPromptOverrides`, `githubTokenSecretArn`, and `pollIntervalMs`. If you use a custom `runtimeArn` or secret, pass the ARNs to `TaskOrchestrator` via `additionalRuntimeArns` and `additionalSecretArns` so the Lambda has IAM permission. See [Repo onboarding](../design/REPO_ONBOARDING.md) for the full model.
+Each Blueprint supports per-repo overrides grouped into nested props (`BlueprintProps` in `cdk/src/constructs/blueprint.ts`):
 
-Redeploy after changing Blueprints: `mise run //cdk:deploy`.
+```typescript
+new Blueprint(this, 'MyServiceBlueprint', {
+  repo: 'acme/my-service',
+  repoTable: repoTable.table,
+  compute: { runtimeArn: '...' },                    // override the default runtime ARN
+  agent: {
+    modelId: 'us.anthropic.claude-sonnet-4-6',       // foundation model override
+    maxTurns: 150,                                    // default turn limit for this repo
+    systemPromptOverrides: 'Extra instructions...',   // appended to the platform prompt
+  },
+  credentials: { githubTokenSecretArn: '...' },       // per-repo GitHub token secret
+  pipeline: { pollIntervalMs: 5000 },                 // poll interval awaiting completion
+});
+```
+
+If you use a custom `compute.runtimeArn` or `credentials.githubTokenSecretArn`, pass the ARNs to `TaskOrchestrator` via `additionalRuntimeArns` and `additionalSecretArns` so the Lambda has IAM permission. See [Repo onboarding](../design/REPO_ONBOARDING.md) for the full model.
+
+Redeploy after changing Blueprints: `mise //cdk:deploy`.
 
 ### Customizing the agent image
 
-The default image (`agent/Dockerfile`) includes Python, Node 20, `git`, `gh`, Claude Code CLI, and `mise`. If your repositories need additional runtimes (Java, Go, native libs), extend the Dockerfile. A normal `cdk deploy` rebuilds the image asset.
+The default image (`agent/Dockerfile`) includes Python, Node 24 (LTS), `git`, `gh`, Claude Code CLI, and `mise`. If your repositories need additional runtimes (Java, Go, native libs), extend the Dockerfile. A normal `cdk deploy` rebuilds the image asset.
+
+### Writing Cedar policies for the repo
+
+A blueprint can declare its own `security.cedarPolicies` rules on top of the built-in hard/soft-deny starter set. Hard-deny rules absolutely block a tool call; soft-deny rules pause the agent and ask a human before proceeding.
+
+See the [Cedar policy guide](./CEDAR_POLICY_GUIDE.md) for the full authoring reference — vocabulary (`execute_bash`, `write_file`, `context.command`, `context.file_path`), annotations (`@rule_id`, `@tier`, `@approval_timeout_s`, `@severity`, `@category`), worked examples, multi-match rules, and cross-engine parity testing with [`contracts/cedar-parity/`](../../contracts/cedar-parity/) fixtures.
 
 ### Other options
 
@@ -176,7 +199,7 @@ curl http://localhost:8080/ping
 
 curl -X POST http://localhost:8080/invocations \
   -H "Content-Type: application/json" \
-  -d ‘{"input":{"prompt":"Fix the login bug","repo_url":"owner/repo"}}’
+  -d '{"input":{"prompt":"Fix the login bug","repo_url":"owner/repo"}}'
 ```
 
 #### Monitoring
@@ -237,14 +260,14 @@ Follow the [Quick Start](./QUICK_START.md) steps 3-6 for first-time deployment. 
 
 ```bash
 mise run build
-mise run //cdk:deploy
+mise //cdk:deploy
 ```
 
 A full deploy takes approximately 10 minutes. Expect variation by region and whether container layers are cached.
 
 ### Stack outputs
 
-After deployment, the stack emits these outputs (retrieve with `aws cloudformation describe-stacks --stack-name backgroundagent-dev --query ‘Stacks[0].Outputs’ --output table`):
+After deployment, the stack emits these outputs (retrieve with `aws cloudformation describe-stacks --stack-name backgroundagent-dev --query 'Stacks[0].Outputs' --output table`):
 
 | Output | Description |
 |---|---|
@@ -253,10 +276,16 @@ After deployment, the stack emits these outputs (retrieve with `aws cloudformati
 | `UserPoolId` / `AppClientId` | Cognito identifiers |
 | `TaskTableName` | DynamoDB table for task state |
 | `TaskEventsTableName` | DynamoDB table for audit events |
+| `TaskNudgesTableName` | DynamoDB table for task nudges |
+| `TaskApprovalsTableName` | DynamoDB table for Cedar HITL approval gates |
 | `UserConcurrencyTableName` | DynamoDB table for per-user concurrency |
 | `WebhookTableName` | DynamoDB table for webhook integrations |
 | `RepoTableName` | DynamoDB table for per-repo Blueprint config |
+| `CedarWasmLayerArn` | Lambda layer ARN for the Cedar WASM policy engine |
+| `TraceArtifactsBucketName` | S3 bucket for agent trace artifacts (7-day lifecycle) |
 | `GitHubTokenSecretArn` | Secrets Manager secret ARN for the GitHub PAT |
+
+When the Slack or Linear integrations are enabled, the stack emits additional outputs (e.g. `Slack*` and `Linear*` secret ARNs and integration table names).
 
 Use the same AWS Region as your deployment. If `--region` is omitted, the CLI uses your default from `aws configure`.
 

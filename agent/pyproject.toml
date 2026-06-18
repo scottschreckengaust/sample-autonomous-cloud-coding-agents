@@ -4,14 +4,54 @@ version = "0.1.0"
 description = "Background coding agent — runs tasks in isolated cloud environments and produces pull requests"
 requires-python = ">=3.13"
 dependencies = [
-    "boto3==1.43.6", #https://pypi.org/project/boto3/
-    "claude-agent-sdk==0.1.81", #https://github.com/anthropics/claude-agent-sdk-python
-    "requests==2.34.0", #https://pypi.org/project/requests/
+    "boto3==1.43.9", #https://pypi.org/project/boto3/
+    # Vestigial from the parked AgentCore Identity flow (Phase 2.0a).
+    # Phase 2.0b reads per-workspace Linear OAuth tokens directly from
+    # Secrets Manager because AgentCore Identity's USER_FEDERATION
+    # flow has an open service-side bug (see memory/project_oauth_2_0b.md).
+    # Kept here so the workload-token bridge in `server.py` still
+    # imports cleanly when Phase 2.0c eventually resumes the
+    # AgentCore Identity path. The bridge is now wrapped in
+    # try/except (ImportError, AttributeError), so removing this dep
+    # would degrade gracefully — but for now we keep the dep to
+    # preserve the clean code path.
+    "bedrock-agentcore==1.9.1", #https://pypi.org/project/bedrock-agentcore/
+    "claude-agent-sdk==0.2.82", #https://github.com/anthropics/claude-agent-sdk-python/releases/tag/v0.2.82
+    "requests==2.34.2", #https://pypi.org/project/requests/
     "fastapi==0.136.1", #https://pypi.org/project/fastapi/
-    "uvicorn==0.46.0", #https://pypi.org/project/uvicorn/
-    "aws-opentelemetry-distro~=0.17.0", #https://pypi.org/project/aws-opentelemetry-distro/
+    "uvicorn==0.47.0", #https://pypi.org/project/uvicorn/
+    "aws-opentelemetry-distro==0.17.0", #https://pypi.org/project/aws-opentelemetry-distro/
     "mcp==1.27.1", #https://pypi.org/project/mcp/
-    "cedarpy>=4.8.1", #https://github.com/k9securityio/cedar-py
+    # CEDAR ENGINE PARITY — DO NOT BUMP IN ISOLATION.
+    # cedarpy (Python, agent runtime) and @cedar-policy/cedar-wasm (TypeScript,
+    # CDK Lambdas) are two language bindings over the same Cedar Rust core.
+    # Even patch-version drift between the bindings can produce divergent
+    # (decision, matching_rule_ids) on the same (policy, input) — a class
+    # of bug invisible to per-side unit tests. The contracts/cedar-parity/
+    # golden fixtures are how CI catches divergence; if you bump cedarpy
+    # you MUST bump @cedar-policy/cedar-wasm to a tested-compatible version
+    # in cdk/package.json AND refresh the parity fixtures, in the same
+    # commit. See docs/design/CEDAR_HITL_GATES.md §15.6 (decision #23) and
+    # the parity-contract banner in mise.toml.
+    # EXACT pin (no ^/~). The binding version (4.8.4) is the cedarpy package
+    # release, NOT the Cedar Rust core version — it differs from the TypeScript
+    # binding @cedar-policy/cedar-wasm (pinned at 4.8.2 in cdk/package.json).
+    # Matching binding version *strings* across languages is neither necessary
+    # nor sufficient for behavioral parity; parity is established empirically by
+    # the contracts/cedar-parity/ golden fixtures in CI, which assert identical
+    # (decision, matching_rule_ids) for both bindings on the same (policy, input).
+    "cedarpy==4.8.4", #https://github.com/k9securityio/cedar-py
+    # Workflow-driven tasks (#248): the step runner loads YAML workflow files
+    # and validates them against agent/workflows/schema/workflow.schema.json.
+    # Both were previously only transitively present; declared directly so the
+    # workflow loader does not depend on another package's transitive pin.
+    "pyyaml==6.0.3", #https://pypi.org/project/PyYAML/
+    "jsonschema==4.26.0", #https://pypi.org/project/jsonschema/
+]
+
+[tool.uv]
+constraint-dependencies = [
+    "pyjwt>=2.13.0",  # PYSEC-2026-175/177/178/179 — transitive via mcp; remove when mcp bumps floor (#267)
 ]
 
 [tool.bandit]
@@ -31,6 +71,7 @@ dev = [
     "ty",
     "pytest",
     "pygments==2.20.0",
+    "pytest-cov==7.1.0",
 ]
 
 [tool.ruff]
@@ -49,6 +90,10 @@ select = [
     "SIM",   # flake8-simplify
     "TCH",   # flake8-type-checking
     "RUF",   # ruff-specific rules
+    # AI007 guard (#258): magic-value comparisons should use named constants.
+    # Values shared across Python/TypeScript belong in contracts/constants.json
+    # (see contracts/constants.md).
+    "PLR2004",  # pylint magic-value-comparison
 ]
 ignore = [
     "S603",  # subprocess call — allowed for agent CLI operations
@@ -59,11 +104,22 @@ ignore = [
 "src/entrypoint.py" = ["E402"]  # re-export shim: importlib.reload() call must precede re-export from-imports
 "src/system_prompt.py" = ["E501"]  # long prompt strings
 "src/prompts/*.py" = ["E501"]  # long prompt strings
-"tests/**" = ["S101", "S106", "S108", "E402"]  # assert; test tokens; /tmp paths; importorskip
+"tests/**" = ["S101", "S106", "S108", "E402", "PLR2004"]  # assert; test tokens; /tmp paths; importorskip; literal assertions
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+relative_files = true
+
+[tool.coverage.report]
+fail_under = 72
+precision = 2
+show_missing = true
+skip_covered = true
 
 [tool.ty.environment]
 python-version = "3.13"
